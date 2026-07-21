@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block auth_content %}
+<div class="login-page">
+  <form class="login-card" method="post">
+    <div class="login-brand">من الورق إلى الرقم</div>
+    <div class="login-sub">نظام رقمنة الوثائق المؤسسية</div>
+    {% with msgs = get_flashed_messages() %}
+      {% for m in msgs %}<div class="banner warn">{{ m }}</div>{% endfor %}
+    {% endwith %}
+    <label class="field"><span>اسم المستخدم</span>
+      <input name="username" required autofocus autocomplete="username"></label>
+    <label class="field"><span>كلمة المرور</span>
+      <input name="password" type="password" required autocomplete="current-password"></label>
+    <button type="submit" style="width:100%">دخول</button>
+  </form>
+</div>
+{% endblock %}

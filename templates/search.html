@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>البحث</h1>
+{% if q %}
+  <p class="hint">نتائج «{{ q }}» — {{ results|length }} صفحة</p>
+  {% if results %}
+  <table>
+    <thead><tr><th>الوثيقة</th><th>الصفحة</th><th></th></tr></thead>
+    <tbody>
+    {% for r in results %}
+      <tr><td>#{{ r.doc_id }}</td><td>{{ r.no }}</td>
+        <td><a href="{{ url_for('detail', doc_id=r.doc_id) }}">فتح الوثيقة</a></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="hint">لا نتائج — جرّب كلمة أخرى أو جزءاً منها.</p>{% endif %}
+{% else %}<p class="hint">اكتب كلمة في مربع البحث بالشريط الجانبي.</p>{% endif %}
+{% endblock %}

@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="doc-head">
+  {% if d.score is not none %}
+  <div class="seal stamp-in {% if d.review %}review{% endif %}" style="--pct: {{ d.score }}">
+    <div class="num">{{ d.score }}<small>من 100</small></div>
+  </div>
+  {% endif %}
+  <h1>{{ d.filename }}</h1>
+  <div class="actions">
+    {% if d.has_output %}
+    <a class="btn" href="{{ url_for('download', doc_id=d.id) }}">تنزيل الإكسل</a>
+    {% endif %}
+    <a class="btn ghost" href="{{ url_for('download_word', doc_id=d.id) }}">تنزيل Word</a>
+    {% if d.status != 'approved' %}
+    <form action="{{ url_for('approve', doc_id=d.id) }}" method="post" style="display:inline">
+      <button class="btn approve" type="submit">اعتماد الوثيقة</button>
+    </form>
+    {% else %}
+    <span class="pill approved">معتمدة</span>
+    {% endif %}
+  </div>
+</div>
+<p class="hint">القسم: <a href="{{ url_for('section_home', section_id=d.section_id) }}">{{ d.section_name }}</a></p>
+
+{% if d.status == 'error' %}
+<div class="review-note"><strong>فشلت المعالجة.</strong>
+  {% if d.error %}السبب: {{ d.error }}{% endif %}
+  — احذف الوثيقة وأعد رفعها بعد معالجة السبب.</div>
+{% endif %}
+
+{% if d.status == 'processing' %}
+<div class="progress-card" id="prog">
+  <div class="progress-label" id="prog-label">جارٍ تجهيز المعالجة…</div>
+  <div class="progress-track"><div class="progress-fill" id="prog-fill"></div></div>
+  <p class="hint">تُعالَج كل صفحة: استخراج ← تدقيق بصري ← حفظ. تُعرض النتائج فور الانتهاء.</p>
+</div>
+<script>
+(function(){
+  const fill = document.getElementById('prog-fill');
+  const label = document.getElementById('prog-label');
+  async function poll(){
+    try{
+      const r = await fetch('{{ url_for("progress", doc_id=d.id) }}');
+      const j = await r.json();
+      if(j.total > 0){
+        const pct = Math.min(100, Math.round(j.done / j.total * 100));
+        fill.style.width = pct + '%';
+        label.textContent = j.done < j.total
+          ? 'جارٍ معالجة الصفحة ' + (j.done + 1) + ' من ' + j.total
+          : 'جارٍ تعبئة القالب وإنهاء الملفات…';
+      }
+      if(j.status === 'done' || j.status === 'error'){ location.reload(); return; }
+    }catch(e){}
+    setTimeout(poll, 1500);
+  }
+  poll();
+})();
+</script>
+{% endif %}
+
+{% if d.review %}
+<div class="review-note"><strong>ملاحظات تحتاج تدقيقاً بشرياً:</strong>
+  <ul>{% for n in d.review %}<li>{{ n }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+{% if d.filled %}
+<h2>القيم المعبّأة — عدّل ثم احفظ</h2>
+<form class="fields-form" action="{{ url_for('update_fields', doc_id=d.id) }}" method="post">
+  <table class="kv">
+    {% for k, v in d.filled.items() %}
+    <tr><th>{{ k }}</th><td><input name="{{ k }}" value="{{ v }}"></td></tr>
+    {% endfor %}
+  </table>
+  <p><button type="submit">حفظ التعديلات وتحديث الإكسل</button></p>
+</form>
+{% endif %}
+
+{% if d.table %}
+<h2>الجدول</h2>
+<table><tbody>
+  {% for row in d.table %}
+  <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
+  {% endfor %}
+</tbody></table>
+{% endif %}
+
+<h2>النص المدقّق — عدّل أي صفحة ثم احفظها</h2>
+{% for p in d.pages %}
+<div class="page-card">
+  <div class="page-head">
+    <strong>صفحة {{ p.no }}</strong>
+    {% if p.score is not none %}<span class="conf">دقة {{ p.score }}/100</span>{% endif %}
+    {% if p.notes %}<span class="pill needs_review">فيها ملاحظات</span>{% endif %}
+  </div>
+  <div class="page-body">
+    <div class="page-img">
+      <img src="{{ url_for('page_image', page_id=p.id) }}" alt="صورة صفحة {{ p.no }}" loading="lazy">
+    </div>
+    <div class="page-data">
+      {% if p.notes %}
+      <div class="review-note">{% for n in p.notes %}{{ n }}{% if not loop.last %} · {% endif %}{% endfor %}</div>
+      {% endif %}
+      <form action="{{ url_for('update_text', page_id=p.id) }}" method="post">
+        <textarea name="text">{{ p.corrected }}</textarea>
+        <p><button class="btn small" type="submit">حفظ نص الصفحة</button></p>
+      </form>
+      <details><summary>النص الخام قبل التدقيق (للمقارنة)</summary><pre>{{ p.raw }}</pre></details>
+    </div>
+  </div>
+</div>
+{% endfor %}
+
+<div class="danger-zone">
+  <form action="{{ url_for('delete_document', doc_id=d.id) }}" method="post"
+        onsubmit="return confirm('حذف الوثيقة يحذف صفحاتها وملفاتها الناتجة نهائياً. متابعة؟')">
+    <button class="btn danger small" type="submit">حذف الوثيقة</button>
+  </form>
+</div>
+{% endblock %}

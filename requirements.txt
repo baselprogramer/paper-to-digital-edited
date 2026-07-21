@@ -1,0 +1,14 @@
+flask
+gunicorn
+sqlalchemy
+pymysql
+cryptography
+python-dotenv
+pymupdf
+opencv-python-headless
+pillow
+numpy
+google-generativeai
+anthropic
+python-docx
+requests

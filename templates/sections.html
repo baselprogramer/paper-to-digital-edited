@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>الأقسام</h1>
+{% if mock %}
+<div class="banner warn">الوضع التجريبي مُفعّل (MOCK=1) — النتائج وهمية لاختبار النظام بلا مفاتيح.</div>
+{% else %}
+<div class="banner ok">وضع الإنتاج · محرك الهيكلة: {{ engine }}</div>
+{% endif %}
+
+{% if sections %}
+<div class="grid">
+{% for s in sections %}
+  <a class="tile" href="{{ url_for('section_home', section_id=s.id) }}">
+    <div class="tile-name">{{ s.name }}</div>
+    <div class="tile-desc">{{ s.description or '' }}</div>
+    <div class="tile-meta">{{ counts[s.id] }} وثيقة</div>
+  </a>
+{% endfor %}
+</div>
+{% else %}
+<p class="hint">لا توجد أقسام بعد — كل قسم يجمع نوعاً من الوثائق بقالبه الخاص. أنشئ أول قسم بالأسفل.</p>
+{% endif %}
+
+<h2>إنشاء قسم جديد</h2>
+<form class="card" action="{{ url_for('create_section') }}" method="post" enctype="multipart/form-data">
+  <label class="field"><span>اسم القسم</span>
+    <input name="name" placeholder="مثال: عقود البيع" required></label>
+  <label class="field"><span>وصف (اختياري)</span>
+    <input name="description" placeholder="ما نوع الوثائق التي يعالجها هذا القسم؟"></label>
+  <label class="field"><span>قالب الإكسل الناتج (.xlsx) — اختياري</span>
+    <input type="file" name="template" accept=".xlsx,.xlsm"></label>
+  <button type="submit">إنشاء القسم</button>
+  <p class="hint">بلا قالب: القسم يُصدر Word فقط. مع قالب: يُصدر Word + إكسل معبّأ بحقول قالبك
+    (التسميات في العمود A، والقيم تُكتب في B، وأي جدول بصف ترويسات).</p>
+</form>
+{% endblock %}

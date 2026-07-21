@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ s.name }}</h1>
+<p class="hint">{{ s.description or '' }}
+  {% if s.has_template %} · القالب: {{ s.kv_count }} حقلاً{% if s.table_cols %} + جدول ({{ s.table_cols|length }} أعمدة){% endif %}
+  {% else %} · بلا قالب (تصدير Word فقط){% endif %}</p>
+
+<form class="card" action="{{ url_for('upload', section_id=s.id) }}" method="post" enctype="multipart/form-data">
+  <label class="field"><span>ملف للمعالجة (PDF أو صورة)</span>
+    <input type="file" name="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff" required></label>
+  <button type="submit">رفع ومعالجة</button>
+  <p class="hint">يُستخرج نص كل صفحة، ثم يُدقَّق مع الصورة الأصلية، وتُنتَج الملفات مع نسبة دقة وملاحظات.</p>
+</form>
+
+<h2>وثائق القسم ({{ s.docs|length }})</h2>
+{% if not s.docs %}<p class="hint">لا وثائق بعد — ارفع أول ملف بالأعلى.</p>{% endif %}
+{% if s.docs %}
+<table>
+  <thead><tr><th>#</th><th>الملف</th><th>الصفحات</th><th>الدقة</th><th>الحالة</th><th>الناتج</th><th></th></tr></thead>
+  <tbody>
+  {% for d in s.docs %}
+    <tr>
+      <td>{{ d.id }}</td><td>{{ d.filename }}</td><td>{{ d.pages }}</td>
+      <td>{% if d.score is not none %}{{ d.score }}/100{% else %}—{% endif %}</td>
+      <td><span class="pill {{ d.status }}">{{ {'done':'منجزة','approved':'معتمدة','processing':'قيد المعالجة','error':'خطأ','pending':'بالانتظار'}.get(d.status, d.status) }}</span></td>
+      <td>{% if d.has_output %}<a class="btn small ghost" href="{{ url_for('download', doc_id=d.id) }}">إكسل</a>{% endif %}
+          <a class="btn small ghost" href="{{ url_for('download_word', doc_id=d.id) }}">Word</a></td>
+      <td><a href="{{ url_for('detail', doc_id=d.id) }}">فتح</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if s.learned %}
+<h2>ما تعلّمه هذا القسم من تصحيحاتك ({{ s.learned|length }})</h2>
+<p class="hint">تُحقن هذه التصحيحات تلقائياً في تعليمات النموذج بكل معالجة جديدة — فلا يتكرر الخطأ نفسه.</p>
+<table>
+  <thead><tr><th>الحقل</th><th>قرأه النموذج</th><th>الصحيح</th><th>تكرر</th></tr></thead>
+  <tbody>
+  {% for c in s.learned %}
+    <tr><td>{{ c.label or '— نص —' }}</td><td>{{ c.wrong }}</td>
+        <td><strong>{{ c.right }}</strong></td><td>{{ c.count }}×</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<div class="danger-zone">
+  <form action="{{ url_for('delete_section', section_id=s.id) }}" method="post"
+        onsubmit="return confirm('حذف القسم يحذف كل وثائقه وملفاتها نهائياً. متابعة؟')">
+    <button class="btn danger small" type="submit">حذف القسم وكل وثائقه</button>
+  </form>
+  <p class="hint">الحذف نهائي ولا يمكن التراجع عنه.</p>
+</div>
+{% endblock %}

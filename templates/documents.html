@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>الوثائق ({{ docs|length }})</h1>
+{% if not docs %}<p class="hint">لا توجد وثائق بعد. ابدأ من صفحة الرفع.</p>{% endif %}
+<table>
+  <thead><tr><th>#</th><th>الملف</th><th>الصفحات</th><th>التنظيم</th>
+    <th>الحالة</th><th>مراجعة</th><th></th></tr></thead>
+  <tbody>
+  {% for d in docs %}
+    <tr>
+      <td>{{ d.id }}</td>
+      <td>{{ d.filename }}</td>
+      <td>{{ d.total_pages }}</td>
+      <td>{{ 'صفحة/سجل' if d.output_mode=='per_page' else 'مدمج' }}</td>
+      <td><span class="pill {{ d.status }}">{{ d.status }}</span></td>
+      <td>{% if d.needs_review %}<span class="pill needs_review">مطلوبة</span>{% else %}—{% endif %}</td>
+      <td><a href="{{ url_for('detail', doc_id=d.id) }}">عرض</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

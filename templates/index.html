@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>رفع وثيقة للرقمنة</h1>
+
+{% if mock %}
+<div class="banner warn">الوضع التجريبي مُفعّل (بلا مفاتيح API) — لاختبار كل شيء قبل الشراء.
+  عطّله بضبط <code>MOCK=0</code> ووضع المفاتيح.</div>
+{% else %}
+<div class="banner ok">وضع الإنتاج مُفعّل (Gemini + Claude){% if dual %} — التحقّق المزدوج مُفعّل{% endif %}.</div>
+{% endif %}
+
+<form class="card" action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+  <label class="field">
+    <span>الملف (PDF أو صورة)</span>
+    <input type="file" name="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff" required>
+  </label>
+
+  <fieldset class="field">
+    <legend>طريقة التنظيم</legend>
+    <label class="radio"><input type="radio" name="output_mode" value="per_page" checked>
+      كل صفحة في ملف/سجل مستقل</label>
+    <label class="radio"><input type="radio" name="output_mode" value="single">
+      الملف كله في سجل واحد مدمج</label>
+  </fieldset>
+
+  <button type="submit">رفع ومعالجة</button>
+</form>
+
+<p class="hint">تُقسَّم ملفات PDF تلقائياً إلى صفحات بدقة 300، ثم: تنظيف ← استخراج (Gemini)
+  ← هيكلة وتدقيق (Claude) ← حفظ. يعمل مع المطبوع واليدوي والمختلط.</p>
+{% endblock %}

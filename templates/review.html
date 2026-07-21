@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>قائمة المراجعة البشرية ({{ items|length }})</h1>
+<p class="hint">الصفحات ذات الثقة الأدنى أولاً — راجع الحقول الحسّاسة فقط.</p>
+{% if not items %}<p>لا شيء بحاجة مراجعة. 👍</p>{% endif %}
+<table>
+  <thead><tr><th>الوثيقة</th><th>الصفحة</th><th>رقم المستند</th><th>الثقة</th><th></th></tr></thead>
+  <tbody>
+  {% for it in items %}
+    <tr>
+      <td>#{{ it.doc_id }}</td>
+      <td>{{ it.no }}</td>
+      <td>{{ it.num or '—' }}</td>
+      <td>{{ '%.2f'|format(it.conf) if it.conf is not none else '—' }}</td>
+      <td><a href="{{ url_for('detail', doc_id=it.doc_id) }}">مراجعة</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
