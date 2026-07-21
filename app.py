@@ -1,14 +1,15 @@
 """
 app.py — نظام الأقسام: دخول ← قسم ← رفع ← استخراج (Gemini)
-← تدقيق بصري (Claude مع صورة الصفحة، نسبة /100 + ملاحظات)
+← تصحيح تلقائي (Arabic KB) ← تدقيق بصري (Claude مع صورة الصفحة)
 ← Word دائماً + إكسل معبّأ إن كان للقسم قالب.
 """
+import difflib
 import functools
 import json
 import os
+import re
 import shutil
 import threading
-import difflib
 
 from flask import (Flask, render_template, request, redirect, url_for,
                    send_file, abort, session, flash, jsonify)
@@ -21,13 +22,20 @@ import config as C
 from models import (init_db, SessionLocal, User, Section, Document,
                     Page, Correction)
 from pipeline import pdf_utils, process, template_utils
+from arabic_kb.arabic_kb_models import (
+    init_arabic_kb, log_correction, build_smart_hints
+)
 
 app = Flask(__name__)
 app.secret_key = C.SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = C.MAX_UPLOAD_MB * 1024 * 1024
+
 for d in (C.UPLOADS, C.STORAGE, C.TEMPLATES_DIR, C.OUTPUTS_DIR):
     os.makedirs(d, exist_ok=True)
+
+# تهيئة قواعد البيانات — الموجودة + Arabic KB
 init_db()
+init_arabic_kb()
 
 
 def _rtl(par):
@@ -37,6 +45,7 @@ def _rtl(par):
 
 
 # ---------- الدخول ----------
+
 def login_required(f):
     @functools.wraps(f)
     def wrapper(*a, **k):
@@ -50,9 +59,11 @@ def login_required(f):
 def login():
     if request.method == "POST":
         db = SessionLocal()
-        u = db.query(User).filter_by(username=request.form.get("username", "")).first()
+        u = db.query(User).filter_by(
+            username=request.form.get("username", "")).first()
         db.close()
-        if u and check_password_hash(u.password_hash, request.form.get("password", "")):
+        if u and check_password_hash(u.password_hash,
+                                     request.form.get("password", "")):
             session["user"] = u.username
             return redirect(request.args.get("next") or url_for("sections"))
         flash("اسم المستخدم أو كلمة المرور غير صحيحة")
@@ -66,6 +77,7 @@ def logout():
 
 
 # ---------- الأقسام ----------
+
 @app.route("/")
 @login_required
 def home():
@@ -79,8 +91,8 @@ def sections():
     secs = db.query(Section).order_by(Section.id.desc()).all()
     counts = {s.id: len(s.documents) for s in secs}
     db.close()
-    return render_template("sections.html", sections=secs, counts=counts, mock=C.MOCK,
-                           engine=C.STRUCTURE_ENGINE)
+    return render_template("sections.html", sections=secs, counts=counts,
+                           mock=C.MOCK, engine=C.STRUCTURE_ENGINE)
 
 
 @app.route("/sections/create", methods=["POST"])
@@ -88,8 +100,9 @@ def sections():
 def create_section():
     name = request.form.get("name", "").strip()
     desc = request.form.get("description", "").strip()
-    tpl = request.files.get("template")
+    tpl  = request.files.get("template")
     has_tpl = tpl and tpl.filename
+
     if not name:
         flash("أدخل اسم القسم")
         return redirect(url_for("sections"))
@@ -114,7 +127,7 @@ def create_section():
             flash(f"تعذّرت قراءة القالب: {e}")
             return redirect(url_for("sections"))
         sec.template_path = tpl_path
-        sec.fields_json = json.dumps(fields, ensure_ascii=False)
+        sec.fields_json   = json.dumps(fields, ensure_ascii=False)
         db.commit()
 
     sid = sec.id
@@ -125,33 +138,36 @@ def create_section():
 @app.route("/section/<int:section_id>")
 @login_required
 def section_home(section_id):
-    db = SessionLocal()
+    db  = SessionLocal()
     sec = db.get(Section, section_id)
     if not sec:
         db.close()
         abort(404)
-    fields = json.loads(sec.fields_json) if sec.fields_json else {}
+    fields  = json.loads(sec.fields_json) if sec.fields_json else {}
     learned = (db.query(Correction).filter_by(section_id=sec.id)
                .order_by(Correction.count.desc()).limit(10).all())
-    data = {"id": sec.id, "name": sec.name, "description": sec.description,
-            "learned": [{"label": c.label, "wrong": c.wrong, "right": c.right,
-                         "count": c.count} for c in learned],
-            "has_template": bool(sec.template_path),
-            "kv_count": len(fields.get("kv", [])),
-            "table_cols": (fields.get("table") or {}).get("columns", []),
-            "docs": [{"id": d.id, "filename": d.filename, "pages": d.total_pages,
-                      "status": d.status, "score": d.score,
-                      "has_output": bool(d.output_path)}
-                     for d in sec.documents]}
+    data = {
+        "id": sec.id, "name": sec.name, "description": sec.description,
+        "learned": [{"label": c.label, "wrong": c.wrong,
+                     "right": c.right, "count": c.count} for c in learned],
+        "has_template": bool(sec.template_path),
+        "kv_count":   len(fields.get("kv", [])),
+        "table_cols": (fields.get("table") or {}).get("columns", []),
+        "docs": [{"id": d.id, "filename": d.filename, "pages": d.total_pages,
+                  "status": d.status, "score": d.score,
+                  "has_output": bool(d.output_path)}
+                 for d in sec.documents],
+    }
     db.close()
     return render_template("section.html", s=data)
 
 
-# ---------- رفع ومعالجة داخل قسم ----------
+# ---------- رفع ومعالجة ----------
+
 @app.route("/section/<int:section_id>/upload", methods=["POST"])
 @login_required
 def upload(section_id):
-    db = SessionLocal()
+    db  = SessionLocal()
     sec = db.get(Section, section_id)
     if not sec:
         db.close()
@@ -183,20 +199,23 @@ def upload(section_id):
     doc_id = doc.id
     db.close()
 
-    # المعالجة في خيط خلفي — الواجهة تعرض شريط التقدم فوراً
-    threading.Thread(target=_process_document, args=(doc_id, images, fname),
-                     daemon=True).start()
+    threading.Thread(target=_process_document,
+                     args=(doc_id, images, fname), daemon=True).start()
     return redirect(url_for("detail", doc_id=doc_id))
 
 
 def _process_document(doc_id, images, fname):
-    """يعالج الوثيقة صفحة صفحة في الخلفية ويحدّث التقدم أولاً بأول."""
-    db = SessionLocal()
+    """يعالج الوثيقة صفحة صفحة في الخلفية."""
+    db  = SessionLocal()
     doc = db.get(Document, doc_id)
     sec = doc.section
-    hints = _build_section_hints(db, sec.id) if sec else ""
+
+    # hints يجمع المعرفة الثابتة + تصحيحات القسم السابقة
+    hints = build_smart_hints(sec.id) if sec else ""
+
     try:
         corrected_texts, scores, all_notes = [], [], []
+
         for i, img in enumerate(images, 1):
             out = process.process_page(img, hints=hints)
             corrected_texts.append(f"=== صفحة {i} ===\n{out['corrected_text']}")
@@ -204,42 +223,46 @@ def _process_document(doc_id, images, fname):
                 scores.append(out["score"])
             for n in out["notes"]:
                 all_notes.append(f"صفحة {i}: {n}")
-            db.add(Page(document_id=doc.id, page_no=i, image_path=img,
-                        raw_text=out["raw_text"],
-                        corrected_text=out["corrected_text"],
-                        score=out["score"],
-                        notes=json.dumps(out["notes"], ensure_ascii=False),
-                        structured_json=json.dumps(out["result"], ensure_ascii=False),
-                        needs_review=out["needs_review"],
-                        status="done"))
-            db.commit()  # حفظ كل صفحة فور إنجازها ليتقدّم الشريط
+            db.add(Page(
+                document_id=doc.id, page_no=i, image_path=img,
+                raw_text=out["raw_text"],
+                corrected_text=out["corrected_text"],
+                score=out["score"],
+                notes=json.dumps(out["notes"], ensure_ascii=False),
+                structured_json=json.dumps(out["result"], ensure_ascii=False),
+                needs_review=out["needs_review"],
+                status="done",
+            ))
+            db.commit()
 
         full_text = "\n\n".join(corrected_texts)
-        values = {}
+        values    = {}
 
         if sec and sec.fields_json:
-            fields = json.loads(sec.fields_json)
+            fields     = json.loads(sec.fields_json)
             kv_labels, table_cols = template_utils.labels_of(fields)
-            values = process.structure_for_section(kv_labels, table_cols, full_text,
-                                                   hints=hints)
+            values = process.structure_for_section(
+                kv_labels, table_cols, full_text, hints=hints)
             out_name = f"doc_{doc.id}_{os.path.splitext(fname)[0]}.xlsx"
             out_path = os.path.join(C.OUTPUTS_DIR, out_name)
-            template_utils.fill_template(sec.template_path, fields, values, out_path)
+            template_utils.fill_template(
+                sec.template_path, fields, values, out_path)
             doc.output_path = out_path
 
         tpl_review = values.get("مراجعة", []) if values else []
         all_review = all_notes + [f"حقل: {r}" for r in tpl_review]
-        doc.merged_json = json.dumps(
+        doc.merged_json  = json.dumps(
             {**values, "ملاحظات_التدقيق": all_review}, ensure_ascii=False)
         doc.needs_review = bool(all_review)
-        doc.score = round(sum(scores) / len(scores), 1) if scores else None
-        doc.status = "done"
+        doc.score        = round(sum(scores) / len(scores), 1) if scores else None
+        doc.status       = "done"
         db.commit()
+
     except Exception as e:
         db.rollback()
         try:
             doc = db.get(Document, doc_id)
-            doc.status = "error"
+            doc.status      = "error"
             doc.merged_json = json.dumps({"خطأ": str(e)}, ensure_ascii=False)
             db.commit()
         except Exception:
@@ -248,31 +271,28 @@ def _process_document(doc_id, images, fname):
         db.close()
 
 
+# ---------- ذاكرة التعلم ----------
 
-
-# ---------- ذاكرة التعلم من التصحيحات ----------
 def _save_correction(db, section_id, kind, label, wrong, right):
-    """حفظ/ترقية تصحيح واحد في ذاكرة القسم."""
     wrong, right = (wrong or "").strip(), (right or "").strip()
     if not wrong or not right or wrong == right:
         return
     if len(wrong) > 80 or len(right) > 80:
         return
     row = (db.query(Correction)
-           .filter_by(section_id=section_id, kind=kind, label=label,
-                      wrong=wrong, right=right).first())
+           .filter_by(section_id=section_id, kind=kind,
+                      label=label, wrong=wrong, right=right).first())
     if row:
         row.count += 1
     else:
-        db.add(Correction(section_id=section_id, kind=kind, label=label,
-                          wrong=wrong, right=right))
+        db.add(Correction(section_id=section_id, kind=kind,
+                          label=label, wrong=wrong, right=right))
 
 
 def _harvest_text_diff(db, section_id, old_text, new_text, limit=10):
-    """استخلاص أزواج (خطأ ← تصحيح) من تعديل نص حر عبر مقارنة الكلمات."""
     ow, nw = (old_text or "").split(), (new_text or "").split()
-    sm = difflib.SequenceMatcher(a=ow, b=nw, autojunk=False)
-    saved = 0
+    sm     = difflib.SequenceMatcher(a=ow, b=nw, autojunk=False)
+    saved  = 0
     for op, i1, i2, j1, j2 in sm.get_opcodes():
         if op != "replace" or saved >= limit:
             continue
@@ -283,29 +303,48 @@ def _harvest_text_diff(db, section_id, old_text, new_text, limit=10):
 
 
 def _build_section_hints(db, section_id, max_items=15):
-    """يبني نص «ما تعلمه القسم» ليُحقن في تعليمات النموذج."""
-    rows = (db.query(Correction).filter_by(section_id=section_id)
-            .order_by(Correction.count.desc(), Correction.updated_at.desc())
-            .limit(max_items).all())
-    if not rows:
-        return ""
-    lines = []
-    for r in rows:
-        if r.kind == "field" and r.label:
-            lines.append(f'- في حقل «{r.label}»: قُرئ سابقاً «{r.wrong}» '
-                         f'والصحيح «{r.right}»')
-        else:
-            lines.append(f'- قُرئ سابقاً «{r.wrong}» والصحيح «{r.right}»')
-    return ("تصحيحات بشرية سابقة موثوقة لوثائق هذا القسم — لها الأولوية "
-            "على قراءتك؛ إذا ظهر النمط نفسه فطبّق التصحيح نفسه دون تردد:\n"
-            + "\n".join(lines))
+    """
+    يبني نص hints يجمع:
+    ١. المعرفة الثابتة بالخط الشامي (arabic_patterns)
+    ٢. التصحيحات البشرية السابقة للقسم
+    """
+    from arabic_kb.arabic_kb_models import OCRCorrectionLog
+    from arabic_kb.arabic_patterns import build_ocr_hints_prompt
 
+    lines = [build_ocr_hints_prompt()]
+
+    old_rows = (db.query(Correction).filter_by(section_id=section_id)
+                .order_by(Correction.count.desc(),
+                          Correction.updated_at.desc())
+                .limit(max_items).all())
+
+    new_rows = (db.query(OCRCorrectionLog).filter_by(section_id=section_id)
+                .order_by(OCRCorrectionLog.occurrence_count.desc())
+                .limit(max_items).all())
+
+    if old_rows or new_rows:
+        lines.append("\n【تصحيحات بشرية موثوقة لهذا القسم — طبّقها فوراً】")
+        for r in old_rows:
+            prefix = f"في حقل «{r.label}»: " if r.kind == "field" and r.label else ""
+            lines.append(f"• {prefix}«{r.wrong}» → «{r.right}» [{r.count}x]")
+        for c in new_rows:
+            ctx   = f" (…{c.context_before}…)" if c.context_before else ""
+            field = f" في «{c.field_label}»"   if c.field_label    else ""
+            lines.append(
+                f"• [{c.correction_type}]{field}: "
+                f"«{c.ocr_reading}» → «{c.human_correction}»"
+                f"{ctx} [{c.occurrence_count}x]"
+            )
+
+    return "\n".join(lines)
+
+
+# ---------- عرض وثيقة ----------
 
 @app.route("/document/<int:doc_id>/progress")
 @login_required
 def progress(doc_id):
-    """حالة التقدم للاستطلاع من الواجهة."""
-    db = SessionLocal()
+    db  = SessionLocal()
     doc = db.get(Document, doc_id)
     if not doc:
         db.close()
@@ -317,30 +356,31 @@ def progress(doc_id):
     return jsonify(data)
 
 
-# ---------- عرض وثيقة + التنزيلات ----------
 @app.route("/document/<int:doc_id>")
 @login_required
 def detail(doc_id):
-    db = SessionLocal()
+    db  = SessionLocal()
     doc = db.get(Document, doc_id)
     if not doc:
         db.close()
         abort(404)
     values = json.loads(doc.merged_json) if doc.merged_json else {}
-    pages = [{"no": p.page_no, "id": p.id, "raw": p.raw_text,
-              "corrected": p.corrected_text, "score": p.score,
-              "notes": json.loads(p.notes) if p.notes else []}
-             for p in doc.pages]
-    data = {"id": doc.id, "filename": doc.filename, "status": doc.status,
-            "section_id": doc.section_id,
-            "section_name": doc.section.name if doc.section else "",
-            "has_output": bool(doc.output_path),
-            "score": doc.score,
-            "filled": values.get("حقول", {}),
-            "table": values.get("جدول", []),
-            "review": values.get("ملاحظات_التدقيق", []),
-            "error": values.get("خطأ"),
-            "pages": pages}
+    pages  = [{"no": p.page_no, "id": p.id, "raw": p.raw_text,
+               "corrected": p.corrected_text, "score": p.score,
+               "notes": json.loads(p.notes) if p.notes else []}
+              for p in doc.pages]
+    data = {
+        "id": doc.id, "filename": doc.filename, "status": doc.status,
+        "section_id":   doc.section_id,
+        "section_name": doc.section.name if doc.section else "",
+        "has_output":   bool(doc.output_path),
+        "score":        doc.score,
+        "filled":       values.get("حقول", {}),
+        "table":        values.get("جدول", []),
+        "review":       values.get("ملاحظات_التدقيق", []),
+        "error":        values.get("خطأ"),
+        "pages":        pages,
+    }
     db.close()
     return render_template("detail.html", d=data)
 
@@ -348,7 +388,7 @@ def detail(doc_id):
 @app.route("/document/<int:doc_id>/download")
 @login_required
 def download(doc_id):
-    db = SessionLocal()
+    db  = SessionLocal()
     doc = db.get(Document, doc_id)
     db.close()
     if not doc or not doc.output_path or not os.path.exists(doc.output_path):
@@ -360,21 +400,17 @@ def download(doc_id):
 @app.route("/document/<int:doc_id>/download_word")
 @login_required
 def download_word(doc_id):
-    """Word بالنص المدقّق + نسبة الدقة + ملاحظات التدقيق."""
-    db = SessionLocal()
+    db  = SessionLocal()
     doc = db.get(Document, doc_id)
     if not doc:
         db.close()
         abort(404)
-    values = json.loads(doc.merged_json) if doc.merged_json else {}
-    pages = [(p.page_no, p.corrected_text or p.raw_text, p.score)
-             for p in doc.pages]
+    values    = json.loads(doc.merged_json) if doc.merged_json else {}
+    pages     = [(p.page_no, p.corrected_text or p.raw_text, p.score)
+                 for p in doc.pages]
     base_name = os.path.splitext(doc.filename)[0]
-    doc_score = doc.score
     db.close()
 
-    # ملف Word = المخرَج النظيف فقط: الحقول + الجدول + النص المدقّق.
-    # (نسب الدقة وملاحظات المراجعة تبقى في الواجهة ولا تدخل الملف النهائي.)
     w = DocxDocument()
     _rtl(w.add_heading(base_name, level=1))
 
@@ -401,32 +437,54 @@ def download_word(doc_id):
                      download_name=os.path.basename(out))
 
 
-
-
 # ---------- تعديل وتدقيق بعد المعالجة ----------
+
 @app.route("/document/<int:doc_id>/update_fields", methods=["POST"])
 @login_required
 def update_fields(doc_id):
-    """حفظ تعديلات المدقق على الحقول وإعادة توليد ملف الإكسل."""
-    db = SessionLocal()
+    db  = SessionLocal()
     doc = db.get(Document, doc_id)
     if not doc:
         db.close()
         abort(404)
-    values = json.loads(doc.merged_json) if doc.merged_json else {}
+    values     = json.loads(doc.merged_json) if doc.merged_json else {}
     old_fields = values.get("حقول", {})
     new_fields = {k: v.strip() for k, v in request.form.items()}
+
     if doc.section_id:
         for k, new_v in new_fields.items():
-            _save_correction(db, doc.section_id, "field", k,
-                             old_fields.get(k, ""), new_v)
-    values["حقول"] = new_fields
+            old_v = old_fields.get(k, "")
+            # تصحيح corrections الكلاسيكي
+            _save_correction(db, doc.section_id, "field", k, old_v, new_v)
+            # سجل تفصيلي جديد مع نوع الحقل
+            if old_v and new_v and old_v != new_v:
+                if "تاريخ" in k:
+                    ctype = "date"
+                elif "وطني" in k or "هوية" in k:
+                    ctype = "national_id"
+                elif "مبلغ" in k or "سعر" in k:
+                    ctype = "amount"
+                elif "اسم" in k:
+                    ctype = "name"
+                elif re.search(r"[٠-٩0-9]", old_v):
+                    ctype = "digit"
+                else:
+                    ctype = "other"
+                log_correction(
+                    section_id=doc.section_id,
+                    page_id=None,
+                    ocr_reading=old_v,
+                    human_correction=new_v,
+                    correction_type=ctype,
+                    field_label=k,
+                )
 
+    values["حقول"] = new_fields
     sec = doc.section
     if sec and sec.fields_json and sec.template_path and doc.output_path:
         fields = json.loads(sec.fields_json)
-        template_utils.fill_template(sec.template_path, fields, values,
-                                     doc.output_path)
+        template_utils.fill_template(
+            sec.template_path, fields, values, doc.output_path)
 
     doc.merged_json = json.dumps(values, ensure_ascii=False)
     db.commit()
@@ -438,16 +496,49 @@ def update_fields(doc_id):
 @app.route("/page/<int:page_id>/update_text", methods=["POST"])
 @login_required
 def update_text(page_id):
-    """حفظ تعديل المدقق على نص صفحة — ينعكس في ملف Word عند تنزيله."""
     db = SessionLocal()
-    p = db.get(Page, page_id)
+    p  = db.get(Page, page_id)
     if not p:
         db.close()
         abort(404)
     new_text = request.form.get("text", "")
+    old_text = p.corrected_text or ""
+
     if p.document and p.document.section_id:
-        _harvest_text_diff(db, p.document.section_id,
-                           p.corrected_text, new_text)
+        sid = p.document.section_id
+
+        # تصحيح corrections الكلاسيكي
+        _harvest_text_diff(db, sid, old_text, new_text)
+
+        # سجل تفصيلي جديد مع السياق الكامل
+        ow, nw = old_text.split(), new_text.split()
+        sm = difflib.SequenceMatcher(a=ow, b=nw, autojunk=False)
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            if op != "replace":
+                continue
+            wrong = " ".join(ow[i1:i2])
+            right = " ".join(nw[j1:j2])
+            if not wrong or not right or wrong == right:
+                continue
+            ctx_before = " ".join(ow[max(0, i1 - 3):i1])
+            ctx_after  = " ".join(ow[i2:min(len(ow), i2 + 3)])
+            if re.search(r"[٠-٩0-9]", wrong):
+                ctype = "digit"
+            elif any(n in right for n in ["محمد", "أحمد", "خالد", "نهاد",
+                                           "فاطمة", "مريم", "علي", "عمر"]):
+                ctype = "name"
+            else:
+                ctype = "word"
+            log_correction(
+                section_id=sid,
+                page_id=page_id,
+                ocr_reading=wrong,
+                human_correction=right,
+                correction_type=ctype,
+                context_before=ctx_before,
+                context_after=ctx_after,
+            )
+
     p.corrected_text = new_text
     doc_id = p.document_id
     db.commit()
@@ -459,12 +550,11 @@ def update_text(page_id):
 @app.route("/document/<int:doc_id>/approve", methods=["POST"])
 @login_required
 def approve(doc_id):
-    """اعتماد الوثيقة بعد المراجعة البشرية."""
-    db = SessionLocal()
+    db  = SessionLocal()
     doc = db.get(Document, doc_id)
     if doc:
         doc.needs_review = False
-        doc.status = "approved"
+        doc.status       = "approved"
         db.commit()
     db.close()
     flash("اعتُمدت الوثيقة")
@@ -474,7 +564,7 @@ def approve(doc_id):
 @app.route("/document/<int:doc_id>/delete", methods=["POST"])
 @login_required
 def delete_document(doc_id):
-    db = SessionLocal()
+    db  = SessionLocal()
     doc = db.get(Document, doc_id)
     if not doc:
         db.close()
@@ -485,14 +575,14 @@ def delete_document(doc_id):
     db.commit()
     db.close()
     flash("حُذفت الوثيقة وملفاتها")
-    return redirect(url_for("section_home", section_id=sid) if sid
-                    else url_for("sections"))
+    return redirect(url_for("section_home", section_id=sid)
+                    if sid else url_for("sections"))
 
 
 @app.route("/section/<int:section_id>/delete", methods=["POST"])
 @login_required
 def delete_section(section_id):
-    db = SessionLocal()
+    db  = SessionLocal()
     sec = db.get(Section, section_id)
     if not sec:
         db.close()
@@ -510,14 +600,13 @@ def delete_section(section_id):
 
 
 def _delete_document_files(doc):
-    """حذف ملفات الوثيقة من القرص (صور الصفحات + النواتج)."""
     page_dir = os.path.join(C.STORAGE, str(doc.id))
     if os.path.isdir(page_dir):
         shutil.rmtree(page_dir, ignore_errors=True)
     if doc.output_path and os.path.exists(doc.output_path):
         os.remove(doc.output_path)
-    base = os.path.splitext(doc.filename)[0]
-    docx = os.path.join(C.OUTPUTS_DIR, f"doc_{doc.id}_{base}.docx")
+    base  = os.path.splitext(doc.filename)[0]
+    docx  = os.path.join(C.OUTPUTS_DIR, f"doc_{doc.id}_{base}.docx")
     if os.path.exists(docx):
         os.remove(docx)
 
@@ -526,7 +615,7 @@ def _delete_document_files(doc):
 @login_required
 def page_image(page_id):
     db = SessionLocal()
-    p = db.get(Page, page_id)
+    p  = db.get(Page, page_id)
     db.close()
     if not p or not os.path.exists(p.image_path):
         abort(404)
@@ -534,20 +623,23 @@ def page_image(page_id):
 
 
 # ---------- بحث ----------
+
 @app.route("/search")
 @login_required
 def search():
-    q = request.args.get("q", "").strip()
+    q       = request.args.get("q", "").strip()
     results = []
     if q:
-        db = SessionLocal()
+        db   = SessionLocal()
         like = f"%{q}%"
         pages = db.query(Page).filter(
-            (Page.corrected_text.like(like)) | (Page.raw_text.like(like))).all()
+            (Page.corrected_text.like(like)) |
+            (Page.raw_text.like(like))
+        ).all()
         results = [{"doc_id": p.document_id, "no": p.page_no} for p in pages]
         db.close()
     return render_template("search.html", q=q, results=results)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0",debug=True, port=5000)
+    app.run(host="0.0.0.0", debug=True, port=5000)
