@@ -1,7 +1,6 @@
 """معالجة الوثائق:
-تنظيف ← استخراج (Gemini) ← تصحيح تلقائي (Arabic KB) ←
-تدقيق بصري (Claude يقارن النص مع صورة الصفحة الأصلية)
-← تعبئة قالب القسم (إن وُجد).
+تنظيف ← استخراج (Gemini) ← تصحيح تلقائي (Arabic KB + Number Validator) ←
+تدقيق بصري (Claude) ← تعبئة قالب القسم.
 """
 import base64
 import json
@@ -17,9 +16,10 @@ from arabic_kb.arabic_patterns import (
     build_audit_hints_prompt,
     normalize_arabic_text,
 )
+from arabic_kb.number_validator import validate_and_fix_numbers
 
 # =============================================================================
-# الـ Prompts — محسّنة بالمعرفة الشامية
+# الـ Prompts
 # =============================================================================
 
 EXTRACT_PROMPT = (
@@ -34,17 +34,16 @@ AUDIT_VISION_PROMPT = (
     "اعتبر نص الأساس هو القراءة المعتمدة، ومهمتك تحسينه فقط عبر مقارنته بالصورة:\n"
     "- انسخ نص الأساس كما هو بنيةً وترتيباً وصياغةً.\n"
     "- غيّر كلمة أو رقماً فقط إذا أظهرت الصورة بوضوح تام قراءة مختلفة.\n"
-    "- إن لم تكن متأكداً تماماً من قراءة أفضل، أبقِ قراءة الأساس كما هي.\n"
+    "- إن لم تكن متأكداً تماماً، أبقِ قراءة الأساس كما هي.\n"
     "- لا تضف داخل النص أي شرح أو وصف.\n"
-    "- «ملاحظات»: فقط الشكوك الجوهرية التي تؤثر على البيانات "
-    "(أرقام مستندات، مبالغ، تواريخ، أسماء) — بحد أقصى 5 ملاحظات قصيرة.\n"
-    "- «نسبة»: تقديرك 0-100 لمدى مطابقة النص النهائي للصورة.\n\n"
+    "- «ملاحظات»: فقط الشكوك الجوهرية على البيانات الحساسة "
+    "(أرقام، تواريخ، أسماء، نسب) — بحد أقصى 5 ملاحظات.\n"
+    "- «نسبة»: تقديرك 0-100.\n\n"
     + build_audit_hints_prompt() +
-    "\n\nأخرج JSON فقط بلا أي شرح:\n"
+    "\n\nأخرج JSON فقط:\n"
     '{"نص_مصحح": "...", "نسبة": 0, "ملاحظات": ["..."]}\n\n'
     "نص الأساس:\n"
 )
-
 
 # =============================================================================
 # تنظيف الصورة
@@ -78,9 +77,8 @@ def clean_image(path):
     cv2.imwrite(out, g)
     return out
 
-
 # =============================================================================
-# الاستخراج — Gemini أو OpenRouter
+# الاستخراج
 # =============================================================================
 
 def _gemini_model():
@@ -98,8 +96,7 @@ def _openrouter_chat(content, max_tokens=4000):
         OPENROUTER_URL,
         headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
                  "Content-Type": "application/json"},
-        json={"model": C.EXTRACT_MODEL,
-              "max_tokens": max_tokens,
+        json={"model": C.EXTRACT_MODEL, "max_tokens": max_tokens,
               "messages": [{"role": "user", "content": content}]},
         timeout=300)
     resp.raise_for_status()
@@ -114,9 +111,8 @@ def _openrouter_extract(image_path):
         b64 = base64.standard_b64encode(f.read()).decode()
     mime = mimetypes.guess_type(image_path)[0] or "image/png"
     return _openrouter_chat([
-        {"type": "image_url",
-         "image_url": {"url": f"data:{mime};base64,{b64}"}},
-        {"type": "text", "text": EXTRACT_PROMPT},
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+        {"type": "text",      "text": EXTRACT_PROMPT},
     ])
 
 
@@ -136,7 +132,6 @@ def extract(image_path):
     return model.generate_content([{"mime_type": mime, "data": data},
                                    EXTRACT_PROMPT]).text
 
-
 # =============================================================================
 # التدقيق البصري — Claude
 # =============================================================================
@@ -148,15 +143,16 @@ def _parse_json_reply(text):
     return json.loads(text)
 
 
-def audit_page(image_path, raw_text, hints=""):
+def audit_page(image_path, raw_text, hints="", validator_warnings=None):
     """
-    يقارن النص الخام مع صورة الصفحة الأصلية.
-    يعيد: {"corrected": str, "score": float|None, "notes": [...]}
+    يقارن النص مع الصورة.
+    validator_warnings: تحذيرات الـ number_validator تُضاف للـ prompt
+    لتوجيه Claude لمراجعة أرقام محددة.
     """
     if C.MOCK:
         corrected = raw_text.replace("14/1.", "14/ر.")
         return {"corrected": corrected, "score": 88.0,
-                "notes": ["رقم الكشف: حرف «ر» التبس بالرقم 1 — تم تصحيحه"]}
+                "notes": ["رقم الكشف: «ر» التبست بـ ١"]}
     if C.STRUCTURE_ENGINE != "claude":
         return {"corrected": raw_text, "score": None, "notes": []}
 
@@ -166,7 +162,21 @@ def audit_page(image_path, raw_text, hints=""):
         b64 = base64.standard_b64encode(f.read()).decode()
     mime = mimetypes.guess_type(image_path)[0] or "image/png"
 
-    full_prompt = AUDIT_VISION_PROMPT + ((hints + "\n\n") if hints else "") + raw_text
+    # إضافة تحذيرات الـ validator كتعليمات إضافية لـ Claude
+    extra = ""
+    if validator_warnings:
+        extra = (
+            "\n⚠️ تحذيرات مدقق الأرقام التلقائي — راجع هذه المواضع في الصورة:\n"
+            + "\n".join(f"  • {w}" for w in validator_warnings)
+            + "\n\n"
+        )
+
+    full_prompt = (
+        AUDIT_VISION_PROMPT
+        + extra
+        + ((hints + "\n\n") if hints else "")
+        + raw_text
+    )
 
     msg = client.messages.create(
         model=C.STRUCTURE_MODEL, max_tokens=4000,
@@ -177,13 +187,14 @@ def audit_page(image_path, raw_text, hints=""):
         ]}])
     try:
         r = _parse_json_reply(msg.content[0].text)
-        return {"corrected": r.get("نص_مصحح") or raw_text,
-                "score":     float(r["نسبة"]) if r.get("نسبة") is not None else None,
-                "notes":     r.get("ملاحظات", [])}
+        return {
+            "corrected": r.get("نص_مصحح") or raw_text,
+            "score":     float(r["نسبة"]) if r.get("نسبة") is not None else None,
+            "notes":     r.get("ملاحظات", []),
+        }
     except Exception:
         return {"corrected": raw_text, "score": None,
-                "notes": ["تعذّر التدقيق البصري لهذه الصفحة"]}
-
+                "notes": ["تعذّر التدقيق البصري"]}
 
 # =============================================================================
 # تعبئة قالب القسم
@@ -193,13 +204,12 @@ def _section_prompt(kv_labels, table_columns, full_text, hints=""):
     tbl = (f"وأعمدة الجدول: {json.dumps(table_columns, ensure_ascii=False)}\n"
            if table_columns else "")
     return (
-        "لديك نص مدقّق من وثيقة عربية (عدة صفحات). المطلوب تعبئة قالب.\n"
-        f"حقول القالب (املأ ما تجده فقط، واترك غير الموجود فارغاً):\n"
-        f"{json.dumps(kv_labels, ensure_ascii=False)}\n{tbl}"
-        "انتبه بشدة للأرقام والحروف المتشابهة (ر/1، 5/15، 0/o).\n"
-        "أخرج JSON فقط بلا أي شرح بالشكل:\n"
+        "لديك نص مدقّق من وثيقة عربية. المطلوب تعبئة قالب.\n"
+        f"حقول القالب:\n{json.dumps(kv_labels, ensure_ascii=False)}\n{tbl}"
+        "انتبه بشدة للأرقام والحروف المتشابهة (ر/١، ٥/٠، ٢/٣).\n"
+        "أخرج JSON فقط:\n"
         '{"حقول": {"اسم الحقل": "القيمة"}, '
-        '"جدول": [["قيمة عمود1", "قيمة عمود2"]], '
+        '"جدول": [["..."]], '
         '"ثقة": {"اسم الحقل": 0.0}, "مراجعة": ["حقول مشكوك فيها"]}\n\n'
         + ((hints + "\n\n") if hints else "")
         + f"النص:\n{full_text}"
@@ -220,7 +230,8 @@ def structure_for_section(kv_labels, table_columns, full_text, hints=""):
         if table_columns:
             demo = {"رقم الشيك": "300030106", "التاريخ": "31/1/2010",
                     "البنك": "المصرف العقاري", "الفرع": "فرع التعاوني",
-                    "المستفيد": "خالد طعمه", "المبلغ": "1320000", "نوع الدفعة": "شيك"}
+                    "المستفيد": "خالد طعمه", "المبلغ": "1320000",
+                    "نوع الدفعة": "شيك"}
             row = [demo.get(c, "") for c in table_columns]
         return {"حقول": vals, "جدول": [row] if row else [],
                 "ثقة": {k: 0.9 for k in vals}, "مراجعة": ["تاريخ العقد"]}
@@ -241,36 +252,55 @@ def structure_for_section(kv_labels, table_columns, full_text, hints=""):
     model = _gemini_model()
     return _parse_json_reply(model.generate_content(prompt).text)
 
-
 # =============================================================================
-# معالجة صفحة كاملة
+# معالجة صفحة كاملة — Pipeline الكامل
 # =============================================================================
 
 def process_page(image_path, hints=""):
     """
-    Pipeline كامل لصفحة واحدة:
+    Pipeline:
     ١. تنظيف الصورة (اختياري)
-    ٢. استخراج النص (Gemini)
-    ٣. تصحيح تلقائي آمن (Arabic KB)
-    ٤. تدقيق بصري (Claude يقارن النص مع الصورة)
+    ٢. استخراج النص — Gemini
+    ٣. تطبيع الأحرف — normalize_arabic_text
+    ٤. تدقيق الأرقام — number_validator (بدون API، تلقائي)
+    ٥. تدقيق بصري — Claude (يرى الصورة + تحذيرات الـ validator)
     """
     src = clean_image(image_path) if C.MODEL_IMAGE == "cleaned" else image_path
 
     # ١. الاستخراج
     raw = extract(src)
 
-    # ٢. تصحيح تلقائي آمن (كاف فارسية، هاء أردية...) — بدون API
+    # ٢. تطبيع الأحرف (كاف فارسية، هاء أردية...)
     raw = normalize_arabic_text(raw)
 
-    # ٣. التدقيق البصري
-    audit = audit_page(src, raw, hints=hints)
+    # ٣. تدقيق الأرقام تلقائياً — بدون API
+    val_result       = validate_and_fix_numbers(raw)
+    raw_validated    = val_result["text"]
+    val_warnings     = val_result["warnings"]
+    val_fixes        = val_result["fixes"]
+
+    # ٤. التدقيق البصري — Claude يرى الصورة + تحذيرات الـ validator
+    audit = audit_page(
+        src,
+        raw_validated,
+        hints=hints,
+        validator_warnings=val_warnings,
+    )
+
+    # دمج ملاحظات الـ validator مع ملاحظات Claude
+    all_notes = []
+    if val_fixes:
+        all_notes.append(f"تصحيحات تلقائية: {', '.join(val_fixes)}")
+    if val_warnings:
+        all_notes.extend(val_warnings)
+    all_notes.extend(audit["notes"])
 
     return {
         "raw_text":       raw,
         "corrected_text": audit["corrected"],
         "score":          audit["score"],
-        "notes":          audit["notes"],
+        "notes":          all_notes,
         "result":         {"data": {"ملخص": audit["corrected"]}},
         "avg_conf":       None,
-        "needs_review":   bool(audit["notes"]),
+        "needs_review":   bool(all_notes),
     }
