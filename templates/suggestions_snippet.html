@@ -1,0 +1,153 @@
+{# =========================================================================
+   مقتطف الاقتراحات — يوضع في detail.html فوق مربع نص الصفحة مباشرة
+   يتوقع: p.id ، p.suggestions ، p.notes
+   ويتوقع مربع نص بالمعرّف: id="text-{{ p.id }}"
+   ========================================================================= #}
+
+<style>
+  .sug-bar        { display:flex; flex-wrap:wrap; gap:.5rem; margin:.75rem 0; }
+  .sug-chip       { display:inline-flex; align-items:center; gap:.4rem;
+                    border:1px solid #d6d3d1; background:#fafaf9;
+                    border-radius:999px; padding:.3rem .6rem;
+                    font-size:.85rem; transition:.15s; }
+  .sug-chip:hover { background:#f5f5f4; border-color:#a8a29e; }
+  .sug-chip.is-claude { border-color:#c7d2fe; background:#eef2ff; }
+  .sug-chip.is-done   { opacity:.45; }
+  .sug-chip.is-refused{ opacity:.35; text-decoration:line-through; }
+  .sug-wrong      { color:#b91c1c; text-decoration:line-through; }
+  .sug-right      { color:#15803d; font-weight:600; }
+  .sug-apply      { border:none; background:#15803d; color:#fff;
+                    border-radius:999px; width:22px; height:22px;
+                    cursor:pointer; line-height:1; font-size:.8rem; }
+  .sug-reject     { border:none; background:#e7e5e4; color:#57534e;
+                    border-radius:999px; width:22px; height:22px;
+                    cursor:pointer; line-height:1; font-size:.8rem; }
+  .sug-apply[disabled], .sug-reject[disabled] { cursor:default; opacity:.5; }
+  .sug-ctx        { color:#78716c; font-size:.72rem; }
+  .sug-empty      { color:#78716c; font-size:.85rem; }
+  .sug-undo       { margin-inline-start:.5rem; font-size:.78rem;
+                    color:#0369a1; cursor:pointer; text-decoration:underline; }
+  .flag-num       { background:#fffbeb; border-right:3px solid #f59e0b;
+                    padding:.5rem .75rem; margin:.4rem 0;
+                    font-size:.85rem; border-radius:4px; }
+</style>
+
+<div class="sug-bar" data-page="{{ p.id }}">
+  {% if p.suggestions %}
+    {% for s in p.suggestions %}
+      <span class="sug-chip {% if s.origin == 'claude' %}is-claude{% endif %}"
+            id="sug-{{ s.id }}"
+            data-page="{{ p.id }}"
+            data-sug="{{ s.id }}"
+            title="{{ s.reason }} — ثقة {{ s.confidence }}">
+        <span class="sug-wrong">{{ s.wrong }}</span>
+        <span>&larr;</span>
+        <span class="sug-right">{{ s.suggested }}</span>
+        {% if s.before or s.after %}
+          <span class="sug-ctx">({{ s.before }} … {{ s.after }})</span>
+        {% endif %}
+        <button type="button" class="sug-apply"  title="تطبيق">&#10003;</button>
+        <button type="button" class="sug-reject" title="رفض">&#10007;</button>
+      </span>
+    {% endfor %}
+  {% else %}
+    <span class="sug-empty">لا اقتراحات نصية لهذه الصفحة</span>
+  {% endif %}
+</div>
+
+{# ملاحظات الأرقام — بلا أزرار، مراجعة بصرية فقط #}
+{% if p.notes %}
+  {% for n in p.notes %}
+    <div class="flag-num">&#128269; {{ n }}</div>
+  {% endfor %}
+{% endif %}
+
+<script>
+(function () {
+  // يُنفَّذ مرة واحدة فقط مهما تكرر المقتطف عبر الصفحات
+  if (window.__sugInit) return;
+  window.__sugInit = true;
+
+  var undoStack = {};
+
+  function chipOf(el) {
+    return el.closest ? el.closest('.sug-chip') : null;
+  }
+
+  function lock(chip, cls) {
+    chip.classList.add(cls);
+    var btns = chip.querySelectorAll('button');
+    for (var i = 0; i < btns.length; i++) btns[i].disabled = true;
+  }
+
+  function unlock(chip, cls) {
+    chip.classList.remove(cls);
+    var btns = chip.querySelectorAll('button');
+    for (var i = 0; i < btns.length; i++) btns[i].disabled = false;
+  }
+
+  async function applySug(chip) {
+    var pageId = chip.getAttribute('data-page');
+    var sugId  = chip.getAttribute('data-sug');
+    var box    = document.getElementById('text-' + pageId);
+    if (!box) { alert('لم يُعثر على مربع النص للصفحة ' + pageId); return; }
+
+    var before = box.value;
+    var fd = new FormData();
+    fd.append('text', before);
+
+    try {
+      var res  = await fetch('/page/' + pageId + '/apply/' + sugId,
+                             { method: 'POST', body: fd });
+      var data = await res.json();
+
+      if (!data.ok) { alert(data.message || 'تعذّر التطبيق'); return; }
+
+      undoStack[sugId] = before;
+      box.value = data.text;
+      lock(chip, 'is-done');
+
+      var undo = document.createElement('span');
+      undo.className = 'sug-undo';
+      undo.textContent = 'تراجع';
+      undo.addEventListener('click', function () {
+        box.value = undoStack[sugId];
+        unlock(chip, 'is-done');
+        undo.remove();
+      });
+      chip.appendChild(undo);
+    } catch (e) {
+      alert('خطأ في الاتصال: ' + e);
+    }
+  }
+
+  async function rejectSug(chip) {
+    var pageId = chip.getAttribute('data-page');
+    var sugId  = chip.getAttribute('data-sug');
+    try {
+      var res  = await fetch('/page/' + pageId + '/reject/' + sugId,
+                             { method: 'POST' });
+      var data = await res.json();
+      if (data.ok) lock(chip, 'is-refused');
+    } catch (e) {
+      alert('خطأ في الاتصال: ' + e);
+    }
+  }
+
+  // مستمع واحد على المستند كله — يعمل مع أي عدد من الصفحات
+  document.addEventListener('click', function (ev) {
+    var t = ev.target;
+    if (!t || !t.classList) return;
+
+    if (t.classList.contains('sug-apply')) {
+      ev.preventDefault();
+      var c1 = chipOf(t);
+      if (c1) applySug(c1);
+    } else if (t.classList.contains('sug-reject')) {
+      ev.preventDefault();
+      var c2 = chipOf(t);
+      if (c2) rejectSug(c2);
+    }
+  });
+})();
+</script>

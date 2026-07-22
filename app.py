@@ -1,7 +1,7 @@
 """
 app.py — نظام الأقسام: دخول ← قسم ← رفع ← استخراج (Gemini)
-← تصحيح تلقائي (Arabic KB) ← تدقيق بصري (Claude مع صورة الصفحة)
-← Word دائماً + إكسل معبّأ إن كان للقسم قالب.
+← تصحيح تلقائي (Arabic KB) ← تدقيق بصري (Claude: اقتراحات نصية)
+← أزرار تصحيح للمراجع البشري ← Word + إكسل معبّأ.
 """
 import difflib
 import functools
@@ -25,6 +25,14 @@ from pipeline import pdf_utils, process, template_utils
 from arabic_kb.arabic_kb_models import (
     init_arabic_kb, log_correction, build_smart_hints
 )
+from arabic_kb.lexicon_models import (
+    init_lexicon, add_term, add_terms_from_text, lexicon_stats
+)
+from arabic_kb.suggestions import (
+    init_suggestions, build_for_page, apply_suggestion,
+    reject_suggestion, get_page_suggestions, suggestion_accuracy
+)
+
 
 app = Flask(__name__)
 app.secret_key = C.SECRET_KEY
@@ -33,9 +41,11 @@ app.config["MAX_CONTENT_LENGTH"] = C.MAX_UPLOAD_MB * 1024 * 1024
 for d in (C.UPLOADS, C.STORAGE, C.TEMPLATES_DIR, C.OUTPUTS_DIR):
     os.makedirs(d, exist_ok=True)
 
-# تهيئة قواعد البيانات — الموجودة + Arabic KB
+# تهيئة قواعد البيانات
 init_db()
 init_arabic_kb()
+init_lexicon()
+init_suggestions()
 
 
 def _rtl(par):
@@ -210,7 +220,6 @@ def _process_document(doc_id, images, fname):
     doc = db.get(Document, doc_id)
     sec = doc.section
 
-    # hints يجمع المعرفة الثابتة + تصحيحات القسم السابقة
     hints = build_smart_hints(sec.id) if sec else ""
 
     try:
@@ -223,7 +232,8 @@ def _process_document(doc_id, images, fname):
                 scores.append(out["score"])
             for n in out["notes"]:
                 all_notes.append(f"صفحة {i}: {n}")
-            db.add(Page(
+
+            page_obj = Page(
                 document_id=doc.id, page_no=i, image_path=img,
                 raw_text=out["raw_text"],
                 corrected_text=out["corrected_text"],
@@ -232,8 +242,17 @@ def _process_document(doc_id, images, fname):
                 structured_json=json.dumps(out["result"], ensure_ascii=False),
                 needs_review=out["needs_review"],
                 status="done",
-            ))
+            )
+            db.add(page_obj)
             db.commit()
+
+            # بناء اقتراحات الصفحة: قاموس محلي + Claude
+            try:
+                build_for_page(page_obj.id,
+                               out["corrected_text"],
+                               out.get("suggestions", []))
+            except Exception as e:
+                print(f"تعذّر بناء اقتراحات الصفحة {i}: {e}")
 
         full_text = "\n\n".join(corrected_texts)
         values    = {}
@@ -303,11 +322,7 @@ def _harvest_text_diff(db, section_id, old_text, new_text, limit=10):
 
 
 def _build_section_hints(db, section_id, max_items=15):
-    """
-    يبني نص hints يجمع:
-    ١. المعرفة الثابتة بالخط الشامي (arabic_patterns)
-    ٢. التصحيحات البشرية السابقة للقسم
-    """
+    """يجمع المعرفة الثابتة + تصحيحات القسم السابقة."""
     from arabic_kb.arabic_kb_models import OCRCorrectionLog
     from arabic_kb.arabic_patterns import build_ocr_hints_prompt
 
@@ -367,7 +382,8 @@ def detail(doc_id):
     values = json.loads(doc.merged_json) if doc.merged_json else {}
     pages  = [{"no": p.page_no, "id": p.id, "raw": p.raw_text,
                "corrected": p.corrected_text, "score": p.score,
-               "notes": json.loads(p.notes) if p.notes else []}
+               "notes": json.loads(p.notes) if p.notes else [],
+               "suggestions": get_page_suggestions(p.id)}
               for p in doc.pages]
     data = {
         "id": doc.id, "filename": doc.filename, "status": doc.status,
@@ -437,6 +453,60 @@ def download_word(doc_id):
                      download_name=os.path.basename(out))
 
 
+# ---------- الاقتراحات ----------
+
+@app.route("/page/<int:page_id>/suggestions")
+@login_required
+def page_suggestions(page_id):
+    """يجلب اقتراحات الصفحة المعلّقة."""
+    return jsonify({"suggestions": get_page_suggestions(page_id)})
+
+
+@app.route("/page/<int:page_id>/apply/<int:sug_id>", methods=["POST"])
+@login_required
+def apply_sug(page_id, sug_id):
+    """يطبّق اقتراحاً على نص الصفحة ويحفظه."""
+    db = SessionLocal()
+    try:
+        p = db.get(Page, page_id)
+        if not p:
+            abort(404)
+        # النص المرسل من الواجهة له الأولوية (قد يكون المستخدم عدّل يدوياً)
+        current = request.form.get("text") or p.corrected_text or ""
+        res = apply_suggestion(sug_id, current)
+        if res["ok"]:
+            p.corrected_text = res["text"]
+            db.commit()
+        return jsonify(res)
+    finally:
+        db.close()
+
+
+@app.route("/page/<int:page_id>/reject/<int:sug_id>", methods=["POST"])
+@login_required
+def reject_sug(page_id, sug_id):
+    """يرفض اقتراحاً — والكلمة الأصلية تدخل القاموس كصحيحة."""
+    return jsonify(reject_suggestion(sug_id))
+
+
+@app.route("/lexicon/stats")
+@login_required
+def lex_stats():
+    """إحصاءات القاموس ودقة الاقتراحات حسب المصدر."""
+    return jsonify({"lexicon": lexicon_stats(),
+                    "accuracy": suggestion_accuracy()})
+
+
+@app.route("/lexicon/add", methods=["POST"])
+@login_required
+def lex_add():
+    """إضافة مصطلح يدوياً للقاموس."""
+    term  = request.form.get("term", "").strip()
+    ttype = request.form.get("type", "person")
+    ok = add_term(term, ttype, source="verified")
+    return jsonify({"ok": ok, "term": term})
+
+
 # ---------- تعديل وتدقيق بعد المعالجة ----------
 
 @app.route("/document/<int:doc_id>/update_fields", methods=["POST"])
@@ -454,9 +524,7 @@ def update_fields(doc_id):
     if doc.section_id:
         for k, new_v in new_fields.items():
             old_v = old_fields.get(k, "")
-            # تصحيح corrections الكلاسيكي
             _save_correction(db, doc.section_id, "field", k, old_v, new_v)
-            # سجل تفصيلي جديد مع نوع الحقل
             if old_v and new_v and old_v != new_v:
                 if "تاريخ" in k:
                     ctype = "date"
@@ -478,6 +546,11 @@ def update_fields(doc_id):
                     correction_type=ctype,
                     field_label=k,
                 )
+                # اسم أو منطقة مصحَّحة يدوياً ← القاموس
+                if ctype == "name":
+                    add_term(new_v, "person", source="verified")
+                elif "منطقة" in k or "المنطقة" in k:
+                    add_term(new_v, "region", source="verified")
 
     values["حقول"] = new_fields
     sec = doc.section
@@ -507,10 +580,8 @@ def update_text(page_id):
     if p.document and p.document.section_id:
         sid = p.document.section_id
 
-        # تصحيح corrections الكلاسيكي
         _harvest_text_diff(db, sid, old_text, new_text)
 
-        # سجل تفصيلي جديد مع السياق الكامل
         ow, nw = old_text.split(), new_text.split()
         sm = difflib.SequenceMatcher(a=ow, b=nw, autojunk=False)
         for op, i1, i2, j1, j2 in sm.get_opcodes():
@@ -524,9 +595,6 @@ def update_text(page_id):
             ctx_after  = " ".join(ow[i2:min(len(ow), i2 + 3)])
             if re.search(r"[٠-٩0-9]", wrong):
                 ctype = "digit"
-            elif any(n in right for n in ["محمد", "أحمد", "خالد", "نهاد",
-                                           "فاطمة", "مريم", "علي", "عمر"]):
-                ctype = "name"
             else:
                 ctype = "word"
             log_correction(
@@ -543,6 +611,13 @@ def update_text(page_id):
     doc_id = p.document_id
     db.commit()
     db.close()
+
+    # التعديل اليدوي مصدر موثوق — يغذّي القاموس
+    try:
+        add_terms_from_text(new_text)
+    except Exception as e:
+        print(f"تعذّر تغذية القاموس: {e}")
+
     flash("حُفظ نص الصفحة")
     return redirect(url_for("detail", doc_id=doc_id))
 
@@ -550,14 +625,25 @@ def update_text(page_id):
 @app.route("/document/<int:doc_id>/approve", methods=["POST"])
 @login_required
 def approve(doc_id):
+    """اعتماد الوثيقة — النص المعتمد بشرياً أوثق مصدر للقاموس."""
     db  = SessionLocal()
     doc = db.get(Document, doc_id)
+    texts = []
     if doc:
+        texts = [p.corrected_text for p in doc.pages if p.corrected_text]
         doc.needs_review = False
         doc.status       = "approved"
         db.commit()
     db.close()
-    flash("اعتُمدت الوثيقة")
+
+    added = 0
+    for t in texts:
+        try:
+            added += add_terms_from_text(t)
+        except Exception as e:
+            print(f"تعذّرت تغذية القاموس: {e}")
+
+    flash(f"اعتُمدت الوثيقة — أُضيف {added} مصطلح للقاموس")
     return redirect(url_for("detail", doc_id=doc_id))
 
 
