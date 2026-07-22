@@ -86,6 +86,84 @@
 </tbody></table>
 {% endif %}
 
+
+{# ===================== تنسيق عمود الاقتراحات ===================== #}
+<style>
+  /* ثلاثة أعمدة: صورة (يمين) | نص (وسط) | اقتراحات (يسار) */
+  .page-body.has-sugs {
+    display: grid;
+    grid-template-columns: 1fr 1.15fr 265px;
+    gap: .85rem;
+    align-items: start;
+  }
+  /* شاشات متوسطة: الصورة والنص جنباً لجنب، والاقتراحات تحتهما بعرض كامل */
+  @media (max-width: 1500px) {
+    .page-body.has-sugs { grid-template-columns: 1fr 1.15fr; }
+    .sug-col { grid-column: 1 / -1; position: static; max-height: none; }
+    .sug-col .sug-card { display: inline-block; width: calc(50% - .5rem);
+                         vertical-align: top; margin-inline-end: .5rem; }
+  }
+  /* شاشات ضيقة: عمود واحد */
+  @media (max-width: 1000px) {
+    .page-body.has-sugs { grid-template-columns: 1fr; }
+    .sug-col .sug-card { display: block; width: 100%; margin-inline-end: 0; }
+  }
+
+  .sug-col {
+    border: 1px solid #e7e5e4;
+    border-radius: 10px;
+    background: #fdfdfc;
+    padding: .75rem;
+    position: sticky;
+    top: 1rem;
+    max-height: 78vh;
+    overflow-y: auto;
+  }
+  .sug-col h4 {
+    margin: 0 0 .6rem;
+    font-size: .9rem;
+    color: #44403c;
+    display: flex; align-items: center; gap: .4rem;
+  }
+  .sug-count {
+    background: #15803d; color: #fff; border-radius: 999px;
+    padding: .05rem .45rem; font-size: .72rem;
+  }
+
+  .sug-card {
+    border: 1px solid #e7e5e4;
+    border-radius: 8px;
+    background: #fff;
+    padding: .55rem .6rem;
+    margin-bottom: .5rem;
+    transition: .15s;
+  }
+  .sug-card.is-claude { border-inline-start: 3px solid #6366f1; }
+  .sug-card.is-lexicon{ border-inline-start: 3px solid #0d9488; }
+  .sug-card.is-done   { opacity: .45; background: #f0fdf4; }
+  .sug-card.is-refused{ opacity: .4;  background: #fafaf9; }
+
+  .sug-line { display: flex; align-items: center; gap: .4rem;
+              flex-wrap: wrap; font-size: .92rem; margin-bottom: .35rem; }
+  .sug-wrong { color: #b91c1c; text-decoration: line-through; }
+  .sug-right { color: #15803d; font-weight: 700; }
+  .sug-meta  { font-size: .72rem; color: #78716c; margin-bottom: .4rem;
+               line-height: 1.5; }
+  .sug-acts  { display: flex; gap: .35rem; }
+  .sug-btn   { flex: 1; border: none; border-radius: 6px; cursor: pointer;
+               padding: .3rem .4rem; font-size: .8rem; font-family: inherit; }
+  .sug-ok    { background: #15803d; color: #fff; }
+  .sug-ok:hover { background: #166534; }
+  .sug-no    { background: #f5f5f4; color: #57534e; }
+  .sug-no:hover { background: #e7e5e4; }
+  .sug-btn[disabled] { opacity: .5; cursor: default; }
+  .sug-undo  { display:inline-block; margin-top:.35rem; font-size:.75rem;
+               color:#0369a1; cursor:pointer; text-decoration:underline; }
+  .sug-none  { color: #78716c; font-size: .85rem; text-align: center;
+               padding: 1rem .5rem; }
+  .sug-saved { font-size:.72rem; color:#15803d; margin-top:.3rem; }
+</style>
+
 <h2>النص المدقّق — عدّل أي صفحة ثم احفظها</h2>
 {% for p in d.pages %}
 <div class="page-card">
@@ -94,23 +172,155 @@
     {% if p.score is not none %}<span class="conf">دقة {{ p.score }}/100</span>{% endif %}
     {% if p.notes %}<span class="pill needs_review">فيها ملاحظات</span>{% endif %}
   </div>
-  <div class="page-body">
+
+  <div class="page-body has-sugs">
+
+    {# ---------- يمين: الصورة ---------- #}
     <div class="page-img">
-      <img src="{{ url_for('page_image', page_id=p.id) }}" alt="صورة صفحة {{ p.no }}" loading="lazy">
+      <img src="{{ url_for('page_image', page_id=p.id) }}"
+           alt="صورة صفحة {{ p.no }}" loading="lazy">
     </div>
+
+    {# ---------- وسط: الملاحظات + مربع النص ---------- #}
     <div class="page-data">
       {% if p.notes %}
-      <div class="review-note">{% for n in p.notes %}{{ n }}{% if not loop.last %} · {% endif %}{% endfor %}</div>
+      <div class="review-note">
+        {% for n in p.notes %}{{ n }}{% if not loop.last %} · {% endif %}{% endfor %}
+      </div>
       {% endif %}
       <form action="{{ url_for('update_text', page_id=p.id) }}" method="post">
-        <textarea name="text">{{ p.corrected }}</textarea>
+        <textarea name="text" id="text-{{ p.id }}">{{ p.corrected }}</textarea>
         <p><button class="btn small" type="submit">حفظ نص الصفحة</button></p>
       </form>
       <details><summary>النص الخام قبل التدقيق (للمقارنة)</summary><pre>{{ p.raw }}</pre></details>
     </div>
+
+    {# ---------- يسار: أزرار التصحيح ---------- #}
+    <aside class="sug-col" id="sugcol-{{ p.id }}">
+      <h4>
+        تصحيحات مقترحة
+        {% if p.suggestions %}<span class="sug-count">{{ p.suggestions|length }}</span>{% endif %}
+      </h4>
+
+      {% if p.suggestions %}
+        {% for s in p.suggestions %}
+        <div class="sug-card {% if s.origin == 'claude' %}is-claude{% else %}is-lexicon{% endif %}"
+             id="sug-{{ s.id }}"
+             data-page="{{ p.id }}"
+             data-sug="{{ s.id }}"
+             data-kind="{{ s.kind }}">
+          <div class="sug-line">
+            <span class="sug-wrong">{{ s.wrong }}</span>
+            <span>&larr;</span>
+            <span class="sug-right">{{ s.suggested }}</span>
+          </div>
+          <div class="sug-meta">
+            {% if s.before or s.after %}
+              الموضع: … {{ s.before }} <b>[هنا]</b> {{ s.after }} …<br>
+            {% endif %}
+            {{ s.reason }}
+            {% if s.confidence %} — ثقة {{ (s.confidence * 100)|round|int }}%{% endif %}
+          </div>
+          <div class="sug-acts">
+            <button type="button" class="sug-btn sug-ok">استبدل</button>
+            <button type="button" class="sug-btn sug-no">صحيح كما هو</button>
+          </div>
+        </div>
+        {% endfor %}
+      {% else %}
+        <div class="sug-none">لا اقتراحات نصية لهذه الصفحة</div>
+      {% endif %}
+    </aside>
+
   </div>
 </div>
 {% endfor %}
+
+<script>
+(function () {
+  if (window.__sugInit) return;
+  window.__sugInit = true;
+
+  var undoStack = {};
+
+  function lock(card, cls) {
+    card.classList.add(cls);
+    card.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+  }
+  function unlock(card, cls) {
+    card.classList.remove(cls);
+    card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+  }
+  function note(card, text, color) {
+    var d = document.createElement('div');
+    d.className = 'sug-saved';
+    d.style.color = color || '#15803d';
+    d.textContent = text;
+    card.appendChild(d);
+    return d;
+  }
+
+  async function applySug(card) {
+    var pageId = card.dataset.page;
+    var sugId  = card.dataset.sug;
+    var box    = document.getElementById('text-' + pageId);
+    if (!box) { alert('لم يُعثر على مربع النص للصفحة ' + pageId); return; }
+
+    var before = box.value;
+    var fd = new FormData();
+    fd.append('text', before);
+
+    try {
+      var res  = await fetch('/page/' + pageId + '/apply/' + sugId,
+                             { method: 'POST', body: fd });
+      var data = await res.json();
+      if (!data.ok) { alert(data.message || 'تعذّر التطبيق'); return; }
+
+      undoStack[sugId] = before;
+      box.value = data.text;
+      lock(card, 'is-done');
+      note(card, '✓ استُبدلت وحُفظت في القاموس');
+
+      var u = document.createElement('span');
+      u.className = 'sug-undo';
+      u.textContent = 'تراجع';
+      u.addEventListener('click', function () {
+        box.value = undoStack[sugId];
+        unlock(card, 'is-done');
+        card.querySelectorAll('.sug-saved, .sug-undo').forEach(function (e) { e.remove(); });
+      });
+      card.appendChild(u);
+    } catch (e) {
+      alert('خطأ في الاتصال: ' + e);
+    }
+  }
+
+  async function rejectSug(card) {
+    var pageId = card.dataset.page;
+    var sugId  = card.dataset.sug;
+    try {
+      var res  = await fetch('/page/' + pageId + '/reject/' + sugId,
+                             { method: 'POST' });
+      var data = await res.json();
+      if (data.ok) {
+        lock(card, 'is-refused');
+        note(card, '✓ اعتُمدت الكلمة الأصلية في القاموس', '#57534e');
+      }
+    } catch (e) {
+      alert('خطأ في الاتصال: ' + e);
+    }
+  }
+
+  document.addEventListener('click', function (ev) {
+    var t = ev.target;
+    if (!t || !t.classList) return;
+    var card = t.closest ? t.closest('.sug-card') : null;
+    if (!card) return;
+    if (t.classList.contains('sug-ok'))      { ev.preventDefault(); applySug(card); }
+    else if (t.classList.contains('sug-no')) { ev.preventDefault(); rejectSug(card); }
+  });
+})();
+</script>
 
 <div class="danger-zone">
   <form action="{{ url_for('delete_document', doc_id=d.id) }}" method="post"

@@ -65,7 +65,8 @@ AUDIT_SUGGEST_PROMPT = (
     "2. شكوك الأرقام تذهب في «ملاحظات_أرقام» كنص وصفي فقط، بلا اقتراح بديل.\n"
     "3. لكل اقتراح اذكر «قبل» و«بعد» = الكلمة السابقة واللاحقة حرفياً في النص.\n"
     "   إن تكرر الخطأ في مواضع مختلفة، اجعل لكل موضع اقتراحاً منفصلاً بسياقه.\n"
-    "4. «سبب» = حجة موجزة. «ثقة» بين 0 و1. «نوع» = person أو region أو word.\n\n"
+    "4. «سبب» = حجة موجزة. «ثقة» بين 0 و1. «نوع» = person أو region أو word.\n"
+    "5. «نسبة» عدد صحيح من 0 إلى 100 (مثل 85) — وليس كسراً عشرياً.\n\n"
     + build_audit_hints_prompt() +
     "\n\nأخرج JSON فقط بلا أي شرح:\n"
     '{"تصحيحات":[{"خطأ":"ندير","صح":"نذير","نوع":"person",'
@@ -176,6 +177,22 @@ def _parse_json_reply(text):
     return json.loads(text)
 
 
+def _norm_score(v):
+    """
+    يوحّد نسبة الدقة إلى مقياس 0-100.
+    النموذج قد يعيدها 0-1 (مثل 0.65) أو 0-100 (مثل 65) — نقبل الاثنين.
+    """
+    if v is None:
+        return None
+    try:
+        s = float(v)
+    except (TypeError, ValueError):
+        return None
+    if s <= 1.0:          # جاءت كنسبة عشرية
+        s *= 100.0
+    return round(max(0.0, min(100.0, s)), 1)
+
+
 def audit_page(image_path, raw_text, hints="", validator_warnings=None):
     """
     يعيد:
@@ -227,7 +244,7 @@ def audit_page(image_path, raw_text, hints="", validator_warnings=None):
 
     try:
         r = _parse_json_reply(msg.content[0].text)
-        score = float(r["نسبة"]) if r.get("نسبة") is not None else None
+        score = _norm_score(r.get("نسبة"))
         if SUGGESTION_MODE:
             return {"corrected": raw_text, "score": score,
                     "notes": r.get("ملاحظات_أرقام", []),
