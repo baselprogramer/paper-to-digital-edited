@@ -59,14 +59,16 @@
 </script>
 {% endif %}
 
-{% if d.review %}
-<div class="review-note"><strong>ملاحظات تحتاج تدقيقاً بشرياً:</strong>
-  <ul>{% for n in d.review %}<li>{{ n }}</li>{% endfor %}</ul>
-</div>
-{% endif %}
-
 {% if d.filled %}
+{% set field_notes = [] %}
+{% for n in d.review %}{% if n.startswith('حقل:') %}{% set _ = field_notes.append(n) %}{% endif %}{% endfor %}
 <h2>القيم المعبّأة — عدّل ثم احفظ</h2>
+{% if field_notes %}
+<details class="notes-fold">
+  <summary>{{ field_notes|length }} ملاحظة على الحقول</summary>
+  <ul>{% for n in field_notes %}<li>{{ n|replace('حقل: ', '') }}</li>{% endfor %}</ul>
+</details>
+{% endif %}
 <form class="fields-form" action="{{ url_for('update_fields', doc_id=d.id) }}" method="post">
   <table class="kv">
     {% for k, v in d.filled.items() %}
@@ -162,6 +164,21 @@
   .sug-none  { color: #78716c; font-size: .85rem; text-align: center;
                padding: 1rem .5rem; }
   .sug-saved { font-size:.72rem; color:#15803d; margin-top:.3rem; }
+
+  /* ملاحظات مطوية — منظّمة وغير مُفزعة */
+  .notes-fold {
+    background:#fffdf7; border:1px solid #fde68a; border-radius:8px;
+    padding:.45rem .7rem; margin:.5rem 0; font-size:.85rem;
+  }
+  .notes-fold > summary {
+    cursor:pointer; color:#92400e; font-weight:600; list-style:none;
+    display:flex; align-items:center; gap:.4rem;
+  }
+  .notes-fold > summary::before { content:"🔍"; font-size:.9em; }
+  .notes-fold > summary::-webkit-details-marker { display:none; }
+  .notes-fold[open] > summary { margin-bottom:.4rem; }
+  .notes-fold ul { margin:0; padding-inline-start:1.1rem; }
+  .notes-fold li { margin:.2rem 0; color:#57534e; line-height:1.6; }
 </style>
 
 <h2>النص المدقّق — عدّل أي صفحة ثم احفظها</h2>
@@ -184,9 +201,10 @@
     {# ---------- وسط: الملاحظات + مربع النص ---------- #}
     <div class="page-data">
       {% if p.notes %}
-      <div class="review-note">
-        {% for n in p.notes %}{{ n }}{% if not loop.last %} · {% endif %}{% endfor %}
-      </div>
+      <details class="notes-fold" {% if p.notes|length <= 3 %}open{% endif %}>
+        <summary>{{ p.notes|length }} ملاحظة للمراجعة البصرية</summary>
+        <ul>{% for n in p.notes %}<li>{{ n }}</li>{% endfor %}</ul>
+      </details>
       {% endif %}
       <form action="{{ url_for('update_text', page_id=p.id) }}" method="post">
         <textarea name="text" id="text-{{ p.id }}">{{ p.corrected }}</textarea>
