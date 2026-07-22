@@ -1,7 +1,11 @@
 """معالجة الوثائق:
-تنظيف ← استخراج (Gemini) ← تصحيح تلقائي (Arabic KB) ←
-تدقيق بصري (Claude يقارن النص مع صورة الصفحة الأصلية)
-← تعبئة قالب القسم (إن وُجد).
+تنظيف ← استخراج (Gemini) ← تطبيع أحرف ← تدقيق أرقام محلي
+← تدقيق بصري (Claude: اقتراحات نصية + ملاحظات أرقام) ← تعبئة قالب القسم.
+
+وضع الاقتراحات (SUGGESTION_MODE=1، الافتراضي):
+    Claude لا يعيد كتابة النص — يعيد قائمة اقتراحات فقط.
+    مخرجات أقل (أرخص) وحرية أكبر في الاقتراح (القرار للبشر).
+    أوقفه بـ SUGGESTION_MODE=0 في .env للعودة للسلوك القديم.
 """
 import base64
 import json
@@ -17,9 +21,14 @@ from arabic_kb.arabic_patterns import (
     build_audit_hints_prompt,
     normalize_arabic_text,
 )
+from arabic_kb.number_validator import validate_and_fix_numbers
+
+# وضع الاقتراحات
+SUGGESTION_MODE = os.environ.get("SUGGESTION_MODE", "1") == "1"
+
 
 # =============================================================================
-# الـ Prompts — محسّنة بالمعرفة الشامية
+# الـ Prompts
 # =============================================================================
 
 EXTRACT_PROMPT = (
@@ -29,19 +38,17 @@ EXTRACT_PROMPT = (
     "\nتجاوز التواقيع والأختام والبصمات ولا تصفها بنص. أخرج النص فقط."
 )
 
+# الوضع القديم: Claude يعيد كتابة النص كاملاً
 AUDIT_REWRITE_PROMPT = (
     "أمامك صورة صفحة من وثيقة عربية رسمية، ونص أساس استخرجه نظام موثوق منها.\n"
     "اعتبر نص الأساس هو القراءة المعتمدة، ومهمتك تحسينه فقط عبر مقارنته بالصورة:\n"
     "- انسخ نص الأساس كما هو بنيةً وترتيباً وصياغةً.\n"
     "- غيّر كلمة أو رقماً فقط إذا أظهرت الصورة بوضوح تام قراءة مختلفة.\n"
-    "- إن لم تكن متأكداً تماماً من قراءة أفضل، أبقِ قراءة الأساس كما هي.\n"
-    "- لا تضف داخل النص أي شرح أو وصف.\n"
-    "- «ملاحظات»: فقط الشكوك الجوهرية التي تؤثر على البيانات "
-    "(أرقام مستندات، مبالغ، تواريخ، أسماء) — بحد أقصى 5 ملاحظات قصيرة.\n"
-    "- «نسبة»: تقديرك 0-100 لمدى مطابقة النص النهائي للصورة.\n\n"
+    "- إن لم تكن متأكداً تماماً، أبقِ قراءة الأساس كما هي.\n"
+    "- «ملاحظات»: الشكوك الجوهرية فقط — بحد أقصى 5.\n"
+    "- «نسبة»: تقديرك 0-100.\n\n"
     + build_audit_hints_prompt() +
-    "\n\nأخرج JSON فقط بلا أي شرح:\n"
-    '{"نص_مصحح": "...", "نسبة": 0, "ملاحظات": ["..."]}\n\n'
+    '\n\nأخرج JSON فقط:\n{"نص_مصحح": "...", "نسبة": 0, "ملاحظات": ["..."]}\n\n'
     "نص الأساس:\n"
 )
 
@@ -50,7 +57,7 @@ AUDIT_SUGGEST_PROMPT = (
     "أمامك صورة صفحة من وثيقة عربية رسمية، ونص استخرجه نظام OCR منها.\n\n"
     "مهمتك ليست إعادة كتابة النص. لا تُخرج النص إطلاقاً.\n"
     "مهمتك أن تقارن النص بالصورة وتذكر كل موضع تشك فيه كاقتراح منفصل.\n\n"
-    "بما أن القرار النهائي لمراجع بشري يضغط زراً، فاقتراحك الخاطئ كلفته صفر.\n"
+    "القرار النهائي لمراجع بشري يضغط زراً، فاقتراحك الخاطئ كلفته صفر.\n"
     "لذلك اذكر كل شك عندك — حتى الضعيف — ولا تتحفّظ، لكن اذكر ثقتك بصدق.\n\n"
     "قواعد صارمة:\n"
     "1. «تصحيحات» للنص فقط: أسماء أشخاص، مناطق، كلمات عربية.\n"
@@ -58,7 +65,7 @@ AUDIT_SUGGEST_PROMPT = (
     "2. شكوك الأرقام تذهب في «ملاحظات_أرقام» كنص وصفي فقط، بلا اقتراح بديل.\n"
     "3. لكل اقتراح اذكر «قبل» و«بعد» = الكلمة السابقة واللاحقة حرفياً في النص.\n"
     "   إن تكرر الخطأ في مواضع مختلفة، اجعل لكل موضع اقتراحاً منفصلاً بسياقه.\n"
-    "4. «سبب» = حجة موجزة. «ثقة» بين 0 و1.\n\n"
+    "4. «سبب» = حجة موجزة. «ثقة» بين 0 و1. «نوع» = person أو region أو word.\n\n"
     + build_audit_hints_prompt() +
     "\n\nأخرج JSON فقط بلا أي شرح:\n"
     '{"تصحيحات":[{"خطأ":"ندير","صح":"نذير","نوع":"person",'
@@ -66,7 +73,6 @@ AUDIT_SUGGEST_PROMPT = (
     '"ملاحظات_أرقام":["نسبة الشريك غير واضحة"],"نسبة":0}\n\n'
     "النص المستخرج:\n"
 )
-
 
 
 # =============================================================================
@@ -103,7 +109,7 @@ def clean_image(path):
 
 
 # =============================================================================
-# الاستخراج — Gemini أو OpenRouter
+# الاستخراج
 # =============================================================================
 
 def _gemini_model():
@@ -121,8 +127,7 @@ def _openrouter_chat(content, max_tokens=4000):
         OPENROUTER_URL,
         headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
                  "Content-Type": "application/json"},
-        json={"model": C.EXTRACT_MODEL,
-              "max_tokens": max_tokens,
+        json={"model": C.EXTRACT_MODEL, "max_tokens": max_tokens,
               "messages": [{"role": "user", "content": content}]},
         timeout=300)
     resp.raise_for_status()
@@ -137,9 +142,8 @@ def _openrouter_extract(image_path):
         b64 = base64.standard_b64encode(f.read()).decode()
     mime = mimetypes.guess_type(image_path)[0] or "image/png"
     return _openrouter_chat([
-        {"type": "image_url",
-         "image_url": {"url": f"data:{mime};base64,{b64}"}},
-        {"type": "text", "text": EXTRACT_PROMPT},
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+        {"type": "text",      "text": EXTRACT_PROMPT},
     ])
 
 
@@ -147,8 +151,9 @@ def extract(image_path):
     if C.MOCK:
         name = os.path.basename(image_path)
         return (f"# نص خام تجريبي — {name}\n"
-                "كشف حساب. الرقم: 14/1. التاريخ: 14/1/2010.\n"
-                "قيمة 27,630 سهم من العقار رقم 1476 منطقة زاكية العقارية.\n"
+                "السيد هشام ندير ماطرجي، والسيد صلاح نذير قاطرجي.\n"
+                "العقار رقم 1476 منطقة زاكيه العقارية.\n"
+                "كشف حساب الرقم: 14/1. التاريخ: 14/1/2010.\n"
                 "المبلغ 1,320,000 ل.س. رقم الشيك 300030106.")
     if C.EXTRACT_PROVIDER == "openrouter":
         return _openrouter_extract(image_path)
@@ -201,7 +206,7 @@ def audit_page(image_path, raw_text, hints="", validator_warnings=None):
 
     extra = ""
     if validator_warnings:
-        extra = ("\n تحذيرات مدقق الأرقام — راجعها في الصورة "
+        extra = ("\nتحذيرات مدقق الأرقام — راجعها في الصورة "
                  "واذكرها في «ملاحظات_أرقام» إن أكّدتها:\n"
                  + "\n".join(f"  - {w}" for w in validator_warnings) + "\n\n")
 
@@ -228,7 +233,8 @@ def audit_page(image_path, raw_text, hints="", validator_warnings=None):
                     "notes": r.get("ملاحظات_أرقام", []),
                     "suggestions": r.get("تصحيحات", []), "usage": usage}
         return {"corrected": r.get("نص_مصحح") or raw_text, "score": score,
-                "notes": r.get("ملاحظات", []), "suggestions": [], "usage": usage}
+                "notes": r.get("ملاحظات", []), "suggestions": [],
+                "usage": usage}
     except Exception:
         return {"corrected": raw_text, "score": None,
                 "notes": ["تعذّر التدقيق البصري"],
@@ -243,13 +249,11 @@ def _section_prompt(kv_labels, table_columns, full_text, hints=""):
     tbl = (f"وأعمدة الجدول: {json.dumps(table_columns, ensure_ascii=False)}\n"
            if table_columns else "")
     return (
-        "لديك نص مدقّق من وثيقة عربية (عدة صفحات). المطلوب تعبئة قالب.\n"
-        f"حقول القالب (املأ ما تجده فقط، واترك غير الموجود فارغاً):\n"
-        f"{json.dumps(kv_labels, ensure_ascii=False)}\n{tbl}"
-        "انتبه بشدة للأرقام والحروف المتشابهة (ر/1، 5/15، 0/o).\n"
-        "أخرج JSON فقط بلا أي شرح بالشكل:\n"
-        '{"حقول": {"اسم الحقل": "القيمة"}, '
-        '"جدول": [["قيمة عمود1", "قيمة عمود2"]], '
+        "لديك نص مدقّق من وثيقة عربية. المطلوب تعبئة قالب.\n"
+        f"حقول القالب:\n{json.dumps(kv_labels, ensure_ascii=False)}\n{tbl}"
+        "انتبه بشدة للأرقام والحروف المتشابهة (ر/1، 5/0، 2/3).\n"
+        "أخرج JSON فقط:\n"
+        '{"حقول": {"اسم الحقل": "القيمة"}, "جدول": [["..."]], '
         '"ثقة": {"اسم الحقل": 0.0}, "مراجعة": ["حقول مشكوك فيها"]}\n\n'
         + ((hints + "\n\n") if hints else "")
         + f"النص:\n{full_text}"
@@ -270,7 +274,8 @@ def structure_for_section(kv_labels, table_columns, full_text, hints=""):
         if table_columns:
             demo = {"رقم الشيك": "300030106", "التاريخ": "31/1/2010",
                     "البنك": "المصرف العقاري", "الفرع": "فرع التعاوني",
-                    "المستفيد": "خالد طعمه", "المبلغ": "1320000", "نوع الدفعة": "شيك"}
+                    "المستفيد": "خالد طعمة", "المبلغ": "1320000",
+                    "نوع الدفعة": "شيك"}
             row = [demo.get(c, "") for c in table_columns]
         return {"حقول": vals, "جدول": [row] if row else [],
                 "ثقة": {k: 0.9 for k in vals}, "مراجعة": ["تاريخ العقد"]}
@@ -298,22 +303,33 @@ def structure_for_section(kv_labels, table_columns, full_text, hints=""):
 
 def process_page(image_path, hints=""):
     """
-    Pipeline كامل لصفحة واحدة:
     ١. تنظيف الصورة (اختياري)
-    ٢. استخراج النص (Gemini)
-    ٣. تصحيح تلقائي آمن (Arabic KB)
-    ٤. تدقيق بصري (Claude يقارن النص مع الصورة)
+    ٢. استخراج النص — Gemini
+    ٣. تطبيع الأحرف — بلا API
+    ٤. تدقيق الأرقام محلياً — بلا API
+    ٥. تدقيق بصري — Claude (اقتراحات نصية + ملاحظات أرقام)
     """
     src = clean_image(image_path) if C.MODEL_IMAGE == "cleaned" else image_path
 
-    # ١. الاستخراج
+    # ١+٢ الاستخراج
     raw = extract(src)
 
-    # ٢. تصحيح تلقائي آمن (كاف فارسية، هاء أردية...) — بدون API
+    # ٣ تطبيع الأحرف (كاف فارسية، هاء أردية...)
     raw = normalize_arabic_text(raw)
 
-    # ٣. التدقيق البصري
-    audit = audit_page(src, raw, hints=hints)
+    # ٤ تدقيق الأرقام محلياً
+    val = validate_and_fix_numbers(raw)
+    raw_validated = val["text"]
+
+    # ٥ التدقيق البصري
+    audit = audit_page(src, raw_validated, hints=hints,
+                       validator_warnings=val["warnings"])
+
+    all_notes = []
+    if val["fixes"]:
+        all_notes.append("تصحيحات تلقائية: " + ", ".join(val["fixes"]))
+    all_notes.extend(val["warnings"])
+    all_notes.extend(audit["notes"])
 
     return {
         "raw_text":       raw,
