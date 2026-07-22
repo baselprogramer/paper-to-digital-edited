@@ -179,45 +179,72 @@ def build_for_page(page_id: int, text: str, claude_suggestions=None) -> dict:
 # تطبيق اقتراح — استبدال مثبَّت بالسياق
 # =============================================================================
 
+AR_LETTER = r'\u0621-\u064A\u0670-\u06D3'
+_SEP = r'[\s\u060C\u061B\.\,\;\:\-\|\(\)\[\]\"\'\u00AB\u00BB]*'
+
+
+def _strip_edges(w: str) -> str:
+    """يزيل علامات الترقيم من طرفي كلمة السياق."""
+    return re.sub(rf'^[^{AR_LETTER}0-9\u0660-\u0669]+|'
+                  rf'[^{AR_LETTER}0-9\u0660-\u0669]+$', '', w or '')
+
+
 def _replace_anchored(text: str, wrong: str, right: str,
                       before: str = "", after: str = "") -> tuple:
     """
-    يستبدل «wrong» بـ«right» في الموضع المثبَّت بالسياق فقط.
-    يعيد (النص_الجديد, عدد_الاستبدالات).
+    يستبدل «wrong» بـ«right» في الموضع المثبَّت بالسياق.
+    يعيد (النص_الجديد, عدد_الاستبدالات, سبب_الفشل_إن_وُجد).
 
-    الأولوية:
-      ١. مطابقة محصورة بين before و after → موضع واحد بالضبط
-      ٢. إن تعذّر، أول مطابقة للكلمة ككلمة كاملة
+    سلّم المحاولات — من الأدق إلى الأوسع:
+      ١. قبل + الكلمة + بعد   (يتسامح مع الترقيم بينها)
+      ٢. قبل + الكلمة
+      ٣. الكلمة + بعد
+      ٤. الكلمة ككلمة كاملة، أول موضع
+      ٥. الكلمة بصيغة مطبَّعة (همزات/تاء مربوطة/ألف مقصورة)
     """
-    if not wrong or wrong not in text:
-        return text, 0
+    if not wrong:
+        return text, 0, "الاقتراح فارغ"
 
+    before = _strip_edges(before)
+    after  = _strip_edges(after)
     ww = re.escape(wrong)
 
-    # ١) مثبَّت بالسياق من الجهتين
+    # ١) مثبَّت من الجهتين
     if before and after:
-        pat = re.compile(
-            rf'({re.escape(before)}\s+){ww}(\s+{re.escape(after)})')
+        pat = re.compile(rf'({re.escape(before)}{_SEP}){ww}({_SEP}{re.escape(after)})')
         new, n = pat.subn(rf'\g<1>{right}\g<2>', text, count=1)
         if n:
-            return new, n
+            return new, n, None
 
-    # ٢) مثبَّت من جهة واحدة
+    # ٢) مثبَّت باليمين
     if before:
-        pat = re.compile(rf'({re.escape(before)}\s+){ww}\b')
+        pat = re.compile(rf'({re.escape(before)}{_SEP}){ww}(?![{AR_LETTER}])')
         new, n = pat.subn(rf'\g<1>{right}', text, count=1)
         if n:
-            return new, n
+            return new, n, None
+
+    # ٣) مثبَّت باليسار
     if after:
-        pat = re.compile(rf'\b{ww}(\s+{re.escape(after)})')
+        pat = re.compile(rf'(?<![{AR_LETTER}]){ww}({_SEP}{re.escape(after)})')
         new, n = pat.subn(rf'{right}\g<1>', text, count=1)
         if n:
-            return new, n
+            return new, n, None
 
-    # ٣) كلمة كاملة، أول موضع فقط (لا استبدال جماعي)
-    pat = re.compile(rf'(?<![\u0621-\u064A]){ww}(?![\u0621-\u064A])')
+    # ٤) كلمة كاملة، أول موضع فقط
+    pat = re.compile(rf'(?<![{AR_LETTER}]){ww}(?![{AR_LETTER}])')
     new, n = pat.subn(right, text, count=1)
-    return new, n
+    if n:
+        return new, n, None
+
+    # ٥) مطابقة مطبَّعة — للفروق في الهمزات والتاء المربوطة
+    nw = normalize_for_match(wrong)
+    if nw:
+        for m in re.finditer(rf'[{AR_LETTER}]+', text):
+            if normalize_for_match(m.group()) == nw:
+                new = text[:m.start()] + right + text[m.end():]
+                return new, 1, None
+
+    return text, 0, f"لم تُعثر «{wrong}» في النص — ربما عُدِّلت يدوياً"
 
 
 def apply_suggestion(suggestion_id: int, text: str) -> dict:
@@ -232,12 +259,12 @@ def apply_suggestion(suggestion_id: int, text: str) -> dict:
             return {"ok": False, "text": text, "replaced": 0,
                     "message": "الاقتراح غير موجود"}
 
-        new_text, n = _replace_anchored(
+        new_text, n, why = _replace_anchored(
             text, s.wrong, s.suggested, s.ctx_before, s.ctx_after)
 
         if n == 0:
             return {"ok": False, "text": text, "replaced": 0,
-                    "message": "تعذّر تحديد موضع الكلمة — عدّلها يدوياً"}
+                    "message": why or "تعذّر تحديد موضع الكلمة — عدّلها يدوياً"}
 
         s.decision   = "accepted"
         s.decided_at = datetime.datetime.utcnow()

@@ -157,6 +157,10 @@
   .sug-ok    { background: #15803d; color: #fff; }
   .sug-ok:hover { background: #166534; }
   .sug-no    { background: #f5f5f4; color: #57534e; }
+  .sug-find  { background: #e0f2fe; color: #075985; flex: 0 0 auto;
+               padding-inline: .55rem; }
+  .sug-find:hover { background: #bae6fd; }
+  .sug-card.is-found { box-shadow: 0 0 0 2px #38bdf8; }
   .sug-no:hover { background: #e7e5e4; }
   .sug-btn[disabled] { opacity: .5; cursor: default; }
   .sug-undo  { display:inline-block; margin-top:.35rem; font-size:.75rem;
@@ -226,7 +230,9 @@
              id="sug-{{ s.id }}"
              data-page="{{ p.id }}"
              data-sug="{{ s.id }}"
-             data-kind="{{ s.kind }}">
+             data-kind="{{ s.kind }}"
+             data-before="{{ s.before }}"
+             data-after="{{ s.after }}">
           <div class="sug-line">
             <span class="sug-wrong">{{ s.wrong }}</span>
             <span>&larr;</span>
@@ -240,8 +246,9 @@
             {% if s.confidence %} — ثقة {{ (s.confidence * 100)|round|int }}%{% endif %}
           </div>
           <div class="sug-acts">
+            <button type="button" class="sug-btn sug-find" title="حدّد موضعها في النص">أين؟</button>
             <button type="button" class="sug-btn sug-ok">استبدل</button>
-            <button type="button" class="sug-btn sug-no">صحيح كما هو</button>
+            <button type="button" class="sug-btn sug-no">كما هو</button>
           </div>
         </div>
         {% endfor %}
@@ -329,13 +336,85 @@
     }
   }
 
+  // ---------- تحديد موضع الكلمة في مربع النص ----------
+  var AR = '\u0621-\u064A\u0670-\u06D3';
+
+  function stripEdges(w) {
+    return (w || '').replace(new RegExp('^[^' + AR + '0-9\u0660-\u0669]+'), '')
+                    .replace(new RegExp('[^' + AR + '0-9\u0660-\u0669]+$'), '');
+  }
+  function esc(s) { return (s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+  // يعيد [بداية, نهاية] للمقطع المطلوب تحديده، أو null
+  function locate(text, wrong, before, after) {
+    before = stripEdges(before);
+    after  = stripEdges(after);
+    var SEP = '[\\s\u060C\u061B.,;:\\-|()\\[\\]"\'\u00AB\u00BB]*';
+    var m;
+
+    // ١) العبارة كاملة: قبل + الكلمة + بعد  (هذا ما يريده المراجع — سياق ٣-٤ كلمات)
+    if (before && after) {
+      m = new RegExp(esc(before) + SEP + esc(wrong) + SEP + esc(after)).exec(text);
+      if (m) return [m.index, m.index + m[0].length];
+    }
+    // ٢) قبل + الكلمة
+    if (before) {
+      m = new RegExp(esc(before) + SEP + esc(wrong)).exec(text);
+      if (m) return [m.index, m.index + m[0].length];
+    }
+    // ٣) الكلمة + بعد
+    if (after) {
+      m = new RegExp(esc(wrong) + SEP + esc(after)).exec(text);
+      if (m) return [m.index, m.index + m[0].length];
+    }
+    // ٤) الكلمة وحدها ككلمة كاملة
+    m = new RegExp('(?:^|[^' + AR + '])(' + esc(wrong) + ')(?![' + AR + '])').exec(text);
+    if (m) {
+      var s = m.index + m[0].length - m[1].length;
+      return [s, s + m[1].length];
+    }
+    return null;
+  }
+
+  function findSug(card) {
+    var pageId = card.dataset.page;
+    var box    = document.getElementById('text-' + pageId);
+    if (!box) { alert('لم يُعثر على مربع النص'); return; }
+
+    var wrong  = card.querySelector('.sug-wrong').textContent.trim();
+    var meta   = card.dataset;
+    var before = meta.before || '';
+    var after  = meta.after  || '';
+
+    var pos = locate(box.value, wrong, before, after);
+    if (!pos) {
+      alert('لم تُعثر «' + wrong + '» في النص الحالي — ربما عُدِّلت بالفعل.');
+      return;
+    }
+
+    // مرّر الصفحة للمربع ثم حدّد المقطع
+    box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    box.focus({ preventScroll: true });
+    box.setSelectionRange(pos[0], pos[1]);
+
+    // مرّر داخل المربع إلى السطر المطلوب
+    var cs   = window.getComputedStyle(box);
+    var lh   = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) * 1.5) || 20;
+    var before_lines = box.value.substring(0, pos[0]).split('\n').length - 1;
+    box.scrollTop = Math.max(0, before_lines * lh - box.clientHeight / 2);
+
+    card.classList.add('is-found');
+    setTimeout(function () { card.classList.remove('is-found'); }, 1600);
+  }
+
   document.addEventListener('click', function (ev) {
     var t = ev.target;
     if (!t || !t.classList) return;
     var card = t.closest ? t.closest('.sug-card') : null;
     if (!card) return;
-    if (t.classList.contains('sug-ok'))      { ev.preventDefault(); applySug(card); }
-    else if (t.classList.contains('sug-no')) { ev.preventDefault(); rejectSug(card); }
+    if (t.classList.contains('sug-find'))       { ev.preventDefault(); findSug(card); }
+    else if (t.classList.contains('sug-ok'))    { ev.preventDefault(); applySug(card); }
+    else if (t.classList.contains('sug-no'))    { ev.preventDefault(); rejectSug(card); }
   });
 })();
 </script>
